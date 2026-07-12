@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Project Management Agent</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+  <div class="app">
+
+    <!-- ── HEADER ─────────────────────────────────────────── -->
+    <header class="header">
+      <div class="header-left">
+        <div class="logo-mark">
+          <i class="fas fa-diagram-project"></i>
+        </div>
+        <div class="logo-text">
+          <span class="logo-title">Project Management Agent</span>
+          <span class="logo-sub">Powered by Gemini · 8 Specialist Agents</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="connection-badge" id="connection-badge">
+          <span class="conn-dot" id="conn-dot"></span>
+          <span id="conn-label">Connecting...</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- ── MAIN WORKSPACE ─────────────────────────────────── -->
+    <div class="workspace">
+
+      <!-- LEFT: Agent Panel -->
+      <aside class="agent-panel">
+        <div class="panel-label">SPECIALIST AGENTS</div>
+        <div class="agents-list" id="agents-list">
+          <!-- Populated by JS -->
+        </div>
+
+        <!-- Project Documents RAG upload -->
+        <div class="proj-docs-section">
+          <div class="proj-docs-header">
+            <div class="panel-label">PROJECT DOCUMENTS</div>
+            <button class="refresh-btn" onclick="loadProjectDocs()" title="Refresh">
+              <i class="fas fa-rotate-right"></i>
+            </button>
+          </div>
+          <div class="proj-docs-drop" id="proj-docs-drop"
+               onclick="document.getElementById('proj-docs-input').click()"
+               ondragover="event.preventDefault(); this.classList.add('drag-over')"
+               ondragleave="this.classList.remove('drag-over')"
+               ondrop="handleDocDrop(event)">
+            <i class="fas fa-cloud-upload-alt"></i>
+            <span>Click or drag to upload</span>
+            <span class="proj-docs-types">PDF · DOCX · PPTX · TXT · max 50 MB</span>
+          </div>
+          <input type="file" id="proj-docs-input" accept=".pdf,.docx,.pptx,.txt" multiple style="display:none" onchange="handleDocSelect(event)">
+          <div class="proj-docs-list" id="proj-docs-list">
+            <div class="proj-docs-empty" id="proj-docs-empty">No project documents yet</div>
+          </div>
+          <div class="proj-docs-status" id="proj-docs-status"></div>
+        </div>
+
+        <!-- Gmail connect — pinned to bottom of sidebar -->
+        <div class="gmail-section">
+          <div class="panel-label">YOUR EMAIL</div>
+          <button class="gmail-btn" id="gmail-btn" onclick="connectGmail()">
+            <i class="fab fa-google gmail-icon"></i>
+            <span id="gmail-btn-text">Connect Gmail</span>
+          </button>
+          <div class="gmail-status-text" id="gmail-status-text">Not connected</div>
+        </div>
+      </aside>
+
+      <!-- RIGHT: Activity + Output -->
+      <div class="activity-section">
+
+        <!-- TOP: Chain of Thought -->
+        <div class="thought-panel">
+          <div class="panel-header-row">
+            <div class="panel-label">CHAIN OF THOUGHT</div>
+            <button class="clear-btn" onclick="clearThoughts()">
+              <i class="fas fa-eraser"></i> Clear
+            </button>
+          </div>
+          <div class="thought-scroll" id="thought-scroll">
+            <div class="thought-placeholder" id="thought-placeholder">
+              <i class="fas fa-brain"></i>
+              <p>Agent reasoning and tool activity will appear here in real time.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- BOTTOM STRIP: Output Type + Doc Icons -->
+        <div class="bottom-strip">
+
+          <!-- Output Status -->
+          <div class="output-panel">
+            <div class="panel-label">CURRENT OPERATION</div>
+            <div class="output-status" id="output-status">
+              <div class="op-idle">
+                <i class="fas fa-circle-pause"></i>
+                <span>Idle — ready for your request</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Document Icons + Downloads -->
+          <div class="doc-panel">
+            <div class="doc-panel-header">
+              <div class="panel-label">OUTPUT FILES</div>
+              <button class="refresh-btn" onclick="loadAllFiles()" title="Refresh file list">
+                <i class="fas fa-rotate-right"></i>
+              </button>
+              <button class="refresh-btn file-clear-btn" onclick="clearAllFiles()" title="Clear all output files" style="margin-left:4px;color:#e05c5c;">
+                <i class="fas fa-trash"></i>
+              </button>
+            </div>
+            <div class="doc-icons-row">
+              <div class="doc-icon" id="icon-word" title="Word Documents">
+                <div class="doc-icon-inner word">
+                  <i class="fas fa-file-word"></i>
+                </div>
+                <span class="doc-label">Word</span>
+                <span class="doc-count" id="count-word">0</span>
+              </div>
+              <div class="doc-icon" id="icon-excel" title="Excel Spreadsheets">
+                <div class="doc-icon-inner excel">
+                  <i class="fas fa-file-excel"></i>
+                </div>
+                <span class="doc-label">Excel</span>
+                <span class="doc-count" id="count-excel">0</span>
+              </div>
+              <div class="doc-icon" id="icon-pptx" title="PowerPoint Presentations">
+                <div class="doc-icon-inner pptx">
+                  <i class="fas fa-file-powerpoint"></i>
+                </div>
+                <span class="doc-label">PowerPoint</span>
+                <span class="doc-count" id="count-pptx">0</span>
+              </div>
+            </div>
+            <div class="doc-file-list" id="doc-file-list">
+              <div class="doc-empty" id="doc-empty">No files yet</div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- ── CHAT SECTION ───────────────────────────────────── -->
+    <section class="chat-section">
+      <div class="chat-messages" id="chat-messages">
+        <div class="welcome-msg">
+          <div class="welcome-avatar"><i class="fas fa-robot"></i></div>
+          <div class="welcome-bubble">
+            <p>Welcome! I'm your Project Management orchestrator. I have a team of <strong>8 specialists</strong> ready to help you with planning, scope, team management, executive presentations, financials, prioritization, and communications.</p>
+            <p>How can we help you today?</p>
+          </div>
+        </div>
+      </div>
+      <div class="chat-input-row">
+        <div class="input-wrapper">
+          <i class="fas fa-comment-dots input-icon"></i>
+          <input
+            type="text"
+            id="chat-input"
+            placeholder="Ask your project management team anything..."
+            autocomplete="off"
+          />
+        </div>
+        <button class="send-btn" id="send-btn" onclick="sendMessage()">
+          <i class="fas fa-paper-plane"></i>
+        </button>
+      </div>
+    </section>
+
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
