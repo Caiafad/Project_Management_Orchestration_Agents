@@ -144,17 +144,19 @@ class BaseAgent:
         else:
             first_tool_config = None
 
-        # Thinking budget:
-        #   - First call (tool selection): 1 024 tokens — enough to pick a tool,
-        #     not so much it hangs for minutes.
-        #   - Subsequent calls (document/code generation): 4 096 tokens — gives the
-        #     model enough reasoning headroom to produce complete, untruncated sections.
-        #     Without sufficient thinking budget, complex documents (9-section scope docs,
-        #     multi-sheet Excel scripts) get cut off mid-sentence or mid-section.
-        thinking_cfg_first = types.ThinkingConfig(thinking_budget=1024)
-        thinking_cfg       = types.ThinkingConfig(thinking_budget=4096)
+        # Thinking budgets are model-aware:
+        #   Pro models (complex docs, financial scripts, long JSON tool args):
+        #     - First call: 2 048 — enough to choose the right tool and approach
+        #     - Subsequent calls: 16 384 — full reasoning space for 9-section docs,
+        #       multi-sheet Excel scripts, and PowerPoint JSON without cutting off
+        #   Flash models (emails, RACI, short outputs):
+        #     - First call: 1 024 — lightweight tool selection
+        #     - Subsequent calls: 8 192 — sufficient for simpler structured outputs
+        is_pro = "pro" in self.model.lower()
+        thinking_cfg_first = types.ThinkingConfig(thinking_budget=2048 if is_pro else 1024)
+        thinking_cfg       = types.ThinkingConfig(thinking_budget=16384 if is_pro else 8192)
 
-        # max_output_tokens: Gemini 2.5 Pro supports up to 65 536 output tokens.
+        # max_output_tokens: Gemini 2.5 Pro/Flash both support up to 65 536 output tokens.
         # Without this cap the SDK uses the model default (~8 192), which is too low
         # for large Word documents, multi-sheet Excel scripts, or PowerPoint JSON.
         MAX_OUTPUT_TOKENS = 65536
@@ -239,6 +241,22 @@ class BaseAgent:
                     )
                 )]))
                 override_config = forced_retry_config
+                continue
+
+            # Guard: output truncated — model hit the token cap mid-generation.
+            # This causes cut-off sentences and missing document sections.
+            # Inject a continuation prompt so the model resumes where it left off.
+            if "MAX_TOKENS" in finish_reason:
+                print(f"[{self.name}] MAX_TOKENS hit — injecting continuation prompt", flush=True)
+                if candidate.content and candidate.content.parts:
+                    contents.append(candidate.content)
+                contents.append(types.Content(role="user", parts=[types.Part.from_text(
+                    text=(
+                        "Your previous response was cut off because it reached the output limit. "
+                        "Continue exactly where you left off — do not repeat any content already written. "
+                        "Complete all remaining sections and ensure every required section is fully written."
+                    )
+                )]))
                 continue
 
             # Guard: content can be None if the response was blocked or empty
