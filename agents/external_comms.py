@@ -83,7 +83,7 @@ TOOLS = [
 
 
 class ExternalCommsAgent(BaseAgent):
-    def __init__(self, username: str = None):
+    def __init__(self, username: str = None, is_guest: bool = False):
         from tools.gmail_tools import send_email, read_emails, search_emails, draft_email
 
         tool_handlers = {
@@ -99,4 +99,5 @@ class ExternalCommsAgent(BaseAgent):
             tools=TOOLS,
             tool_handlers=tool_handlers,
             model=AGENT_MODEL,
+            is_guest=is_guest,
         )

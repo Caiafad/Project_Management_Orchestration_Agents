@@ -25,11 +25,19 @@ document.addEventListener("DOMContentLoaded", () => {
   renderAgents();
   connectWebSocket();
   checkGmailStatus();
+  checkSlackStatus();
+  loadSessionInfo();
 
   // Show success banner if redirected back after OAuth
   if (location.search.includes("gmail=connected")) {
     history.replaceState({}, "", "/");
     appendThought("doc", "fa-envelope-circle-check", "#3dd68c", "Gmail connected successfully — emails will now send from your account.");
+  } else if (location.search.includes("slack=connected")) {
+    history.replaceState({}, "", "/");
+    appendThought("doc", "fa-slack", "#3dd68c", "Slack connected successfully — messages will post to your workspace.");
+  } else if (location.search.includes("slack=denied")) {
+    history.replaceState({}, "", "/");
+    appendThought("error", "fa-slack", "#f59e0b", "Slack connection was cancelled.");
   }
 
   const input = document.getElementById("chat-input");
@@ -127,11 +135,53 @@ function handleEvent(event) {
       resetAllAgents();
       break;
 
+    case "quota_exceeded":
+      removeTypingIndicator();
+      appendAgentMessage(event.message);
+      appendThought("error", "fa-hourglass-end", "#f59e0b", event.message);
+      if (event.reason === "session_cap") setTrialBadge(0, true);
+      break;
+
     case "done":
       setProcessing(false);
       resetOutputStatus();
       resetAllAgents();
       break;
+  }
+}
+
+// ── TRIAL / SESSION INFO ───────────────────────────────────────
+const trialState = { isGuest: false, remaining: null, max: null };
+
+async function loadSessionInfo() {
+  try {
+    const resp = await fetch("/api/whoami");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    trialState.isGuest = !!data.is_guest;
+    if (data.is_guest) {
+      trialState.max = data.trial_max_generations;
+      trialState.remaining = data.trial_remaining;
+      setTrialBadge(trialState.remaining, trialState.remaining === 0);
+    }
+  } catch (e) {
+    console.warn("Session info check failed:", e);
+  }
+}
+
+function setTrialBadge(remaining, exhausted) {
+  const badge = document.getElementById("trial-badge");
+  const text  = document.getElementById("trial-badge-text");
+  if (!badge) return;
+  badge.hidden = false;
+  badge.classList.toggle("exhausted", !!exhausted);
+  trialState.remaining = remaining;
+  if (exhausted) {
+    text.textContent = "Trial complete";
+  } else if (remaining === null || remaining === undefined) {
+    text.textContent = "Trial session";
+  } else {
+    text.textContent = `Trial · ${remaining} of ${trialState.max} generations left`;
   }
 }
 
@@ -146,6 +196,11 @@ function sendMessage() {
   addTypingIndicator();
   setProcessing(true);
   ws.send(JSON.stringify({ message: text }));
+
+  // Server increments the quota on receipt; mirror it so the badge stays honest.
+  if (trialState.isGuest && trialState.remaining > 0) {
+    setTrialBadge(trialState.remaining - 1, trialState.remaining - 1 === 0);
+  }
 }
 
 // ── AGENT PANEL ────────────────────────────────────────────────
@@ -623,12 +678,12 @@ async function checkGmailStatus() {
     if (data.connected) {
       btn.classList.add("connected");
       btn.onclick = null;           // disable click when already connected
-      label.textContent  = "Gmail Connected";
+      label.textContent  = "Gmail ✓";
       status.textContent = "✓ Sending from your account";
     } else {
       btn.classList.remove("connected");
       btn.onclick = connectGmail;
-      label.textContent  = "Connect Gmail";
+      label.textContent  = "Gmail";
       status.textContent = "Not connected";
     }
   } catch (e) {
@@ -638,6 +693,40 @@ async function checkGmailStatus() {
 
 function connectGmail() {
   window.location.href = "/oauth/gmail/start";
+}
+
+// ── SLACK CONNECT ──────────────────────────────────────────────
+async function checkSlackStatus() {
+  try {
+    const resp = await fetch("/api/slack/status");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const btn    = document.getElementById("slack-btn");
+    const label  = document.getElementById("slack-btn-text");
+    const status = document.getElementById("slack-status-text");
+    if (data.connected) {
+      btn.classList.add("connected");
+      btn.onclick = null;
+      label.textContent  = "Slack ✓";
+      status.textContent = data.team_name ? `✓ ${data.team_name}` : "✓ Posting to your workspace";
+    } else if (!data.configured) {
+      btn.disabled = true;
+      btn.style.opacity = "0.5";
+      label.textContent  = "Slack";
+      status.textContent = "Not available here";
+    } else {
+      btn.classList.remove("connected");
+      btn.onclick = connectSlack;
+      label.textContent  = "Slack";
+      status.textContent = "Not connected";
+    }
+  } catch (e) {
+    console.warn("Slack status check failed:", e);
+  }
+}
+
+function connectSlack() {
+  window.location.href = "/oauth/slack/start";
 }
 
 function escapeHtml(str) {

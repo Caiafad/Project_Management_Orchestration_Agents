@@ -134,7 +134,7 @@ def require_auth(request: Request) -> str:
     return user
 
 
-def make_session_cookie(response, username: str):
+def make_session_cookie(response, username: str, max_age: int | None = None):
     """Attach a signed session cookie to a response."""
     response.set_cookie(
         key="session",
@@ -142,7 +142,7 @@ def make_session_cookie(response, username: str):
         httponly=True,
         secure=COOKIE_SECURE,
         samesite="lax",
-        max_age=SESSION_MAX_AGE,
+        max_age=max_age if max_age is not None else SESSION_MAX_AGE,
     )
     return response
 
@@ -151,3 +151,12 @@ def clear_session_cookie(response):
     """Remove the session cookie."""
     response.delete_cookie("session")
     return response
+
+
+# ── Guest / trial sessions ────────────────────────────────────────────────────
+GUEST_PREFIX = "guest-"
+
+
+def is_guest(username: str | None) -> bool:
+    """Return True if this username belongs to a trial/guest session."""
+    return bool(username) and username.startswith(GUEST_PREFIX)

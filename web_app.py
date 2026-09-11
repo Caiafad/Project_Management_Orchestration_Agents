@@ -9,8 +9,10 @@ Then open: http://localhost:8000
 
 import sys
 import os
+import re
 import json
 import queue
+import hmac
 import threading
 import asyncio
 from pathlib import Path
@@ -22,9 +24,17 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 import uvicorn
 
-from config import OUTPUT_DIR, PORT
-from auth import require_auth, get_user_from_ws_headers, verify_login, make_session_cookie, clear_session_cookie
+from config import (
+    OUTPUT_DIR, PORT, TRIAL_SESSION_HOURS, TRIAL_MAX_GENERATIONS, PURGE_SECRET,
+    SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_REDIRECT_URI, SLACK_OAUTH_SCOPES,
+)
+from auth import (
+    require_auth, get_user_from_ws_headers, verify_login,
+    make_session_cookie, clear_session_cookie, is_guest,
+)
 from event_orchestrator import EventOrchestrator
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 GMAIL_CREDENTIALS_PATH = os.environ.get("GOOGLE_CREDENTIALS_PATH", "credentials/google_credentials.json")
@@ -64,6 +74,84 @@ async def logout():
     response = RedirectResponse("/login", status_code=302)
     clear_session_cookie(response)
     return response
+
+
+# ── Trial (guest) routes ──────────────────────────────────────────────────────
+
+@app.get("/trial")
+async def trial_page(request: Request):
+    from auth import decode_session
+    if decode_session(request.cookies.get("session")):
+        return RedirectResponse("/", status_code=302)
+    return FileResponse("static/trial.html")
+
+
+@app.post("/trial")
+async def trial_start(email: str = Form(...)):
+    """Email-gated trial entry: mint a guest session (no password) and record the lead."""
+    email = email.strip().lower()
+    if not _EMAIL_RE.match(email) or len(email) > 254:
+        return RedirectResponse("/trial?error=email", status_code=303)
+
+    from tools.trial_store import daily_cap_reached, create_guest
+    from tools.leads_sheet import append_lead
+
+    try:
+        if daily_cap_reached():
+            # Degrade to lead capture only — never a broken page.
+            append_lead(email, "capacity-waitlist")
+            return RedirectResponse("/trial?full=1", status_code=303)
+        guest_id = create_guest(email)
+    except Exception as e:
+        print(f"[trial] failed to create guest session: {e}", flush=True)
+        return RedirectResponse("/trial?error=unavailable", status_code=303)
+
+    append_lead(email, guest_id)
+
+    response = RedirectResponse("/", status_code=303)
+    make_session_cookie(response, guest_id, max_age=TRIAL_SESSION_HOURS * 3600)
+    return response
+
+
+@app.get("/api/whoami")
+async def whoami(username: str = Depends(require_auth)):
+    info = {"username": username, "is_guest": is_guest(username)}
+    if info["is_guest"]:
+        from tools.trial_store import generations_remaining
+        info["trial_max_generations"] = TRIAL_MAX_GENERATIONS
+        try:
+            info["trial_remaining"] = generations_remaining(username)
+        except Exception:
+            info["trial_remaining"] = None
+    return info
+
+
+@app.post("/internal/purge-guests")
+async def purge_guests(request: Request):
+    """Nightly cleanup (Cloud Scheduler): delete expired guest sessions + their GCS output."""
+    provided = request.headers.get("x-purge-secret", "")
+    if not PURGE_SECRET or not hmac.compare_digest(provided, PURGE_SECRET):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    from tools.trial_store import purge_expired
+    from tools.gcs_output import delete_all_files
+    from tools.user_datastore import delete_user_workspace
+    from tools import gmail_token_store, slack_token_store
+
+    purged = purge_expired()
+    summary = {"sessions_purged": len(purged), "files_deleted": 0,
+               "uploads_deleted": 0, "datastores_deleted": 0, "tokens_deleted": 0}
+    for guest_id in purged:
+        try:
+            summary["files_deleted"] += delete_all_files(guest_id)
+        except Exception as e:
+            print(f"[purge] warning: could not delete GCS files for {guest_id}: {e}", flush=True)
+        ws = delete_user_workspace(guest_id)
+        summary["uploads_deleted"] += ws["uploads_deleted"]
+        summary["datastores_deleted"] += int(ws["datastore_deleted"])
+        summary["tokens_deleted"] += int(gmail_token_store.delete_token(guest_id))
+        summary["tokens_deleted"] += int(slack_token_store.delete_token(guest_id))
+    return summary
 
 
 # ── Protected routes ──────────────────────────────────────────────────────────
@@ -147,6 +235,82 @@ async def gmail_oauth_callback(
     response = RedirectResponse("/?gmail=connected", status_code=302)
     response.delete_cookie("oauth_state")
     response.delete_cookie("oauth_cv")
+    return response
+
+
+# ── Slack OAuth (per-user "Add to Slack") ────────────────────────────────────
+
+@app.get("/api/slack/status")
+async def slack_status(username: str = Depends(require_auth)):
+    """Return whether the current user has connected their own Slack workspace."""
+    from tools.slack_token_store import load_token
+    token = load_token(username)
+    return {
+        "connected": bool(token),
+        "team_name": token.get("team_name") if token else None,
+        "configured": bool(SLACK_CLIENT_ID and SLACK_CLIENT_SECRET and SLACK_REDIRECT_URI),
+    }
+
+
+@app.get("/oauth/slack/start")
+async def slack_oauth_start(username: str = Depends(require_auth)):
+    """Redirect user to Slack's consent screen to install the app in their workspace."""
+    if not (SLACK_CLIENT_ID and SLACK_CLIENT_SECRET and SLACK_REDIRECT_URI):
+        raise HTTPException(status_code=503, detail="Slack OAuth is not configured on this server.")
+    import secrets
+    from urllib.parse import urlencode
+    state = secrets.token_urlsafe(24)
+    params = urlencode({
+        "client_id": SLACK_CLIENT_ID,
+        "scope": SLACK_OAUTH_SCOPES,
+        "redirect_uri": SLACK_REDIRECT_URI,
+        "state": state,
+    })
+    cookie_secure = os.environ.get("COOKIE_SECURE", "true").lower() == "true"
+    response = RedirectResponse(f"https://slack.com/oauth/v2/authorize?{params}", status_code=302)
+    response.set_cookie("slack_oauth_state", state, httponly=True, secure=cookie_secure, max_age=600)
+    return response
+
+
+@app.get("/oauth/slack/callback")
+async def slack_oauth_callback(
+    request: Request,
+    code: str = None,
+    state: str = None,
+    error: str = None,
+    username: str = Depends(require_auth),
+):
+    """Exchange the code for a workspace bot token and store it for this user."""
+    if error:
+        return RedirectResponse("/?slack=denied", status_code=302)
+
+    stored_state = request.cookies.get("slack_oauth_state")
+    if not stored_state or not code or stored_state != state:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state — please try again.")
+
+    from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+    from tools.slack_token_store import save_token
+
+    try:
+        result = WebClient().oauth_v2_access(
+            client_id=SLACK_CLIENT_ID,
+            client_secret=SLACK_CLIENT_SECRET,
+            code=code,
+            redirect_uri=SLACK_REDIRECT_URI,
+        )
+    except SlackApiError as e:
+        raise HTTPException(status_code=400, detail=f"Slack authorisation failed: {e.response.get('error')}")
+
+    save_token(username, {
+        "access_token": result["access_token"],
+        "team_id": result.get("team", {}).get("id"),
+        "team_name": result.get("team", {}).get("name"),
+        "bot_user_id": result.get("bot_user_id"),
+    })
+
+    response = RedirectResponse("/?slack=connected", status_code=302)
+    response.delete_cookie("slack_oauth_state")
     return response
 
 
@@ -310,7 +474,22 @@ async def websocket_endpoint(websocket: WebSocket):
     loop = asyncio.get_event_loop()
     event_queue = queue.Queue()
 
-    orchestrator = EventOrchestrator(event_callback=lambda e: event_queue.put(e), username=username)
+    guest = is_guest(username)
+    orchestrator = EventOrchestrator(
+        event_callback=lambda e: event_queue.put(e), username=username, is_guest=guest,
+    )
+
+    QUOTA_MESSAGES = {
+        "session_cap": (
+            f"You've used all {TRIAL_MAX_GENERATIONS} generations in this trial session. "
+            "Your documents are still available to download from the sidebar."
+        ),
+        "daily_cap": (
+            "Today's trial capacity is used up. Your email is on the list — "
+            "we'll open it up for you as soon as capacity frees."
+        ),
+        "expired": "This trial session has expired. Start a new one from the trial page.",
+    }
 
     async def drain_events():
         while True:
@@ -350,6 +529,22 @@ async def websocket_endpoint(websocket: WebSocket):
                     event_queue.get_nowait()
                 except queue.Empty:
                     break
+
+            if guest:
+                from tools.trial_store import check_and_increment
+                try:
+                    verdict = await loop.run_in_executor(None, check_and_increment, username)
+                except Exception as e:
+                    print(f"[trial] quota check failed for {username}: {e}", flush=True)
+                    verdict = {"ok": False, "reason": "daily_cap"}
+                if not verdict["ok"]:
+                    await websocket.send_text(json.dumps({
+                        "type": "quota_exceeded",
+                        "reason": verdict["reason"],
+                        "message": QUOTA_MESSAGES.get(verdict["reason"], QUOTA_MESSAGES["session_cap"]),
+                    }))
+                    await websocket.send_text(json.dumps({"type": "done"}))
+                    continue
 
             threading.Thread(
                 target=orchestrator.run,

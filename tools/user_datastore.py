@@ -225,6 +225,35 @@ def delete_user_document(username: str, filename: str) -> bool:
     return True
 
 
+def delete_user_workspace(username: str) -> dict:
+    """
+    Tear down everything this user's document RAG created: all uploaded files
+    under their GCS prefix and their personal Vertex AI datastore.
+    Used by the nightly guest purge. Best-effort — returns counts, never raises.
+    """
+    uploads_deleted = 0
+    try:
+        gcs = _gcs_client()
+        bucket = gcs.bucket(UPLOAD_BUCKET)
+        for blob in bucket.list_blobs(prefix=f"{UPLOAD_PREFIX}/{username}/"):
+            blob.delete()
+            uploads_deleted += 1
+    except Exception as e:
+        print(f"[user_datastore] warning: could not delete uploads for {username}: {e}", flush=True)
+
+    datastore_deleted = False
+    try:
+        client = discoveryengine.DataStoreServiceClient()
+        client.delete_data_store(name=_ds_name(username))
+        datastore_deleted = True
+    except NotFound:
+        pass
+    except Exception as e:
+        print(f"[user_datastore] warning: could not delete datastore for {username}: {e}", flush=True)
+
+    return {"uploads_deleted": uploads_deleted, "datastore_deleted": datastore_deleted}
+
+
 # ── Search ────────────────────────────────────────────────────────────────────
 
 def search_user_datastore(username: str, query: str, num_results: int = 5) -> list:

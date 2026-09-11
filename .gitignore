@@ -9,3 +9,7 @@ output/
 *.egg-info/
 dist/
 build/
+
+# user store — local dev only, never commit
+users.json
+users_export.tmp

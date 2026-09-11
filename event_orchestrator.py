@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from google import genai
 from google.genai import types
-from config import GEMINI_API_KEY, GEMINI_MODEL
+from config import GEMINI_API_KEY, GEMINI_MODEL, GUEST_GEMINI_MODEL
 from agents.base_agent import convert_tools_to_gemini, _generate_with_retry
 from orchestrator import ORCHESTRATOR_SYSTEM_PROMPT, ORCHESTRATOR_TOOLS
 
@@ -180,7 +180,7 @@ def _wrap_tool_handlers(tool_handlers: dict, emit: Callable, username: str = Non
     return wrapped
 
 
-def _create_event_agent(tool_name: str, emit: Callable, username: str = None):
+def _create_event_agent(tool_name: str, emit: Callable, username: str = None, is_guest: bool = False):
     """Instantiate a sub-agent with event-aware tool handlers."""
     from agents.project_planning import ProjectPlanningAgent
     from agents.scope_definition import ScopeDefinitionAgent
@@ -206,7 +206,10 @@ def _create_event_agent(tool_name: str, emit: Callable, username: str = None):
     }
 
     cls = agent_map[tool_name]
-    agent = cls(username=username) if tool_name in comms_agents else cls()
+    if tool_name in comms_agents:
+        agent = cls(username=username, is_guest=is_guest)
+    else:
+        agent = cls(is_guest=is_guest)
     agent.tool_handlers = _wrap_tool_handlers(agent.tool_handlers, emit, username)
     return agent
 
@@ -214,13 +217,16 @@ def _create_event_agent(tool_name: str, emit: Callable, username: str = None):
 class EventOrchestrator:
     """Orchestrator that emits structured events throughout execution."""
 
-    def __init__(self, event_callback: Callable, username: str = None):
+    def __init__(self, event_callback: Callable, username: str = None, is_guest: bool = False):
         self.emit = event_callback
         self.username = username
+        self.is_guest = is_guest
+        self.model = GUEST_GEMINI_MODEL if is_guest else GEMINI_MODEL
         self.client = genai.Client(api_key=GEMINI_API_KEY)
         self.conversation_history = []
+        self.tools = ORCHESTRATOR_TOOLS
         self.gemini_tools = [types.Tool(
-            function_declarations=convert_tools_to_gemini(ORCHESTRATOR_TOOLS)
+            function_declarations=convert_tools_to_gemini(self.tools)
         )]
         self.config = types.GenerateContentConfig(
             system_instruction=ORCHESTRATOR_SYSTEM_PROMPT,
@@ -242,7 +248,7 @@ class EventOrchestrator:
                 "task": task[:120],
             })
             try:
-                agent = _create_event_agent(tool_name, self.emit, self.username)
+                agent = _create_event_agent(tool_name, self.emit, self.username, self.is_guest)
                 result = agent.run(task, context)
             except Exception as e:
                 result = f"Error: {str(e)}"
@@ -259,7 +265,7 @@ class EventOrchestrator:
             types.Content(role="user", parts=[types.Part.from_text(text=user_input)])
         )
 
-        handlers = {t["name"]: self._delegate_handler(t["name"]) for t in ORCHESTRATOR_TOOLS}
+        handlers = {t["name"]: self._delegate_handler(t["name"]) for t in self.tools}
         malformed_retries = 0
 
         # Config that forces exactly one delegation tool call.
@@ -280,7 +286,7 @@ class EventOrchestrator:
         while True:
             try:
                 response = _generate_with_retry(
-                    self.client, GEMINI_MODEL, self.conversation_history, active_config
+                    self.client, self.model, self.conversation_history, active_config
                 )
             except Exception as e:
                 self.emit({"type": "error", "message": str(e)})

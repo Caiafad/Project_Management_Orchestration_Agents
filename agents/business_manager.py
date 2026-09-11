@@ -206,11 +206,12 @@ TOOL_HANDLERS = {
 
 
 class BusinessManagerAgent(BaseAgent):
-    def __init__(self):
+    def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Business Manager Agent",
             system_prompt=SYSTEM_PROMPT,
             tools=TOOLS,
             tool_handlers=TOOL_HANDLERS,
             model=AGENT_MODEL,
+            is_guest=is_guest,
         )

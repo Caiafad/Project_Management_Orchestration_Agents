@@ -1,99 +1,170 @@
-import time
-import concurrent.futures
-from google import genai
-from google.genai import types
-from config import GEMINI_API_KEY, GEMINI_MODEL
+"""
+BaseAgent — the agentic tool-calling loop every sub-agent runs on.
 
-_GEMINI_TIMEOUT = 240  # seconds per API call before treating as hung
+A sub-agent is stateless per call: run(task, context) builds a fresh
+conversation, forces research first (knowledge_search when available), then
+lets the model call its tools until it produces a final text answer. The result
+is an AgentResult carrying the text, the files the run produced, and an honest
+status — a tool call that returned an error never counts as a produced file.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+
+import httpx
+from google import genai
+from google.genai import types, errors as genai_errors
+
+from config import (
+    GEMINI_API_KEY, GEMINI_MODEL, GUEST_GEMINI_MODEL, GUEST_MAX_OUTPUT_TOKENS, model_for,
+)
+
+log = logging.getLogger(__name__)
+
+GEMINI_TIMEOUT = 240          # seconds per API call before treating it as hung
+MAX_TURNS = 24                # hard cap on model round-trips per agent run
+MAX_CONTINUATIONS = 3         # MAX_TOKENS "continue where you left off" retries
+MAX_MALFORMED_RETRIES = 4
+DEFAULT_MAX_OUTPUT_TOKENS = 65536
+
+# One executor for all Gemini calls. futures are awaited with a timeout and, on
+# expiry, abandoned — the hung call finishes on its own thread without blocking
+# the agent (the previous per-call `with ThreadPoolExecutor` blocked on exit).
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="gemini")
+
+FILE_GEN_TOOLS = frozenset({
+    "execute_python", "create_word_document", "create_excel", "create_powerpoint",
+})
+
+
+class GeminiTimeout(TimeoutError):
+    pass
+
+
+def _is_transient(exc: Exception) -> bool:
+    if isinstance(exc, (GeminiTimeout, httpx.TransportError)):
+        return True
+    if isinstance(exc, genai_errors.ServerError):
+        return True
+    if isinstance(exc, genai_errors.APIError):
+        return getattr(exc, "code", None) in (429, 500, 502, 503, 504)
+    return False
 
 
 def _generate_with_retry(client, model, contents, config, max_retries=5):
-    """Call generate_content with exponential backoff on transient network errors.
-    Each call is wrapped in a 120-second thread timeout to prevent indefinite hangs
-    (which occur in Cloud Run when the Gemini TCP connection silently stalls).
-    """
+    """generate_content with exponential backoff on transient failures and a real timeout."""
     for attempt in range(max_retries):
+        future = _EXECUTOR.submit(
+            client.models.generate_content, model=model, contents=contents, config=config,
+        )
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(
-                    client.models.generate_content,
-                    model=model,
-                    contents=contents,
-                    config=config,
-                )
-                try:
-                    return future.result(timeout=_GEMINI_TIMEOUT)
-                except concurrent.futures.TimeoutError:
-                    raise TimeoutError(
-                        f"Gemini API call timed out after {_GEMINI_TIMEOUT}s"
-                    )
+            return future.result(timeout=GEMINI_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            exc: Exception = GeminiTimeout(f"Gemini call timed out after {GEMINI_TIMEOUT}s")
         except Exception as e:
-            err = str(e)
-            transient = any(k in err for k in (
-                "RemoteProtocolError", "Server disconnected",
-                "Connection reset", "ConnectionError", "TimeoutError",
-                "Stream idle", "partial response", "stream",
-                "503", "502", "429", "500",
-            ))
-            if transient and attempt < max_retries - 1:
-                wait = 2 ** attempt  # 1s, 2s, 4s, 8s, 16s
-                time.sleep(wait)
-                continue
-            raise
+            exc = e
+        if _is_transient(exc) and attempt < max_retries - 1:
+            wait = 2 ** attempt
+            log.warning("Gemini transient error (%s) — retry %d/%d in %ds",
+                        exc, attempt + 1, max_retries - 1, wait)
+            time.sleep(wait)
+            continue
+        raise exc
 
+
+# ── Model-generation-aware config ─────────────────────────────────────────────
+
+def model_generation(model: str) -> int:
+    """Major Gemini generation (2 for gemini-2.5-*, 3 for gemini-3.x-*). Unknown → 3."""
+    m = re.search(r"gemini-(\d+)", model)
+    return int(m.group(1)) if m else 3
+
+
+def make_thinking_config(model: str, phase: str) -> types.ThinkingConfig:
+    """phase: 'select' (choose a tool) or 'work' (produce the long output).
+    Gemini 3.x uses thinking_level; 2.5 uses a token budget."""
+    heavy = "pro" in model.lower()
+    if model_generation(model) >= 3:
+        return types.ThinkingConfig(thinking_level="low" if phase == "select" else "high")
+    if phase == "select":
+        return types.ThinkingConfig(thinking_budget=2048 if heavy else 1024)
+    return types.ThinkingConfig(thinking_budget=16384 if heavy else 8192)
+
+
+# ── Tool schema conversion ────────────────────────────────────────────────────
 
 def _convert_schema(json_schema: dict) -> types.Schema:
-    """Convert a JSON Schema dict (from Anthropic format) to a Gemini types.Schema."""
+    """Convert a JSON-Schema dict to a Gemini types.Schema."""
     type_map = {
-        "string": "STRING",
-        "integer": "INTEGER",
-        "number": "NUMBER",
-        "boolean": "BOOLEAN",
-        "array": "ARRAY",
-        "object": "OBJECT",
+        "string": "STRING", "integer": "INTEGER", "number": "NUMBER",
+        "boolean": "BOOLEAN", "array": "ARRAY", "object": "OBJECT",
     }
-    schema_type = type_map.get(json_schema.get("type", "string"), "STRING")
-
-    kwargs = {"type": schema_type}
-
+    kwargs = {"type": type_map.get(json_schema.get("type", "string"), "STRING")}
     if "description" in json_schema:
         kwargs["description"] = json_schema["description"]
-
     if "properties" in json_schema:
-        kwargs["properties"] = {
-            k: _convert_schema(v) for k, v in json_schema["properties"].items()
-        }
-
+        kwargs["properties"] = {k: _convert_schema(v) for k, v in json_schema["properties"].items()}
     if "required" in json_schema:
         kwargs["required"] = json_schema["required"]
-
     if "items" in json_schema:
         kwargs["items"] = _convert_schema(json_schema["items"])
-
     if "enum" in json_schema:
         kwargs["enum"] = json_schema["enum"]
-
     return types.Schema(**kwargs)
 
 
 def convert_tools_to_gemini(tools: list[dict]) -> list[types.FunctionDeclaration]:
-    """Convert a list of Anthropic-style tool dicts to Gemini FunctionDeclarations."""
     declarations = []
     for tool in tools:
         input_schema = tool.get("input_schema", {})
         params = _convert_schema(input_schema) if input_schema.get("properties") else None
-        declarations.append(
-            types.FunctionDeclaration(
-                name=tool["name"],
-                description=tool.get("description", ""),
-                parameters=params,
-            )
-        )
+        declarations.append(types.FunctionDeclaration(
+            name=tool["name"], description=tool.get("description", ""), parameters=params,
+        ))
     return declarations
 
 
+# ── Tool result interpretation ────────────────────────────────────────────────
+
+def tool_result_ok(tool_name: str, result: str) -> bool:
+    """Did a file-generating tool actually succeed? Errors and validation
+    rejections must not count as a produced file."""
+    try:
+        data = json.loads(result)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(data, dict) or data.get("error"):
+        return False
+    if tool_name == "execute_python":
+        return data.get("exit_code", 1) == 0 and data.get("status") != "needs_revision"
+    return data.get("status") == "created"
+
+
+@dataclass
+class AgentResult:
+    text: str
+    files: list[str] = field(default_factory=list)
+    status: str = "success"        # success | failed
+    error: str | None = None
+
+    def __str__(self) -> str:      # keeps `str(result)` callers working
+        return self.text if self.status == "success" else f"Error: {self.error or self.text}"
+
+
+# ── Base agent ────────────────────────────────────────────────────────────────
+
 class BaseAgent:
-    """Base class for all sub-agents. Provides an agentic tool-calling loop via the Gemini SDK."""
+    """Base class for all sub-agents."""
+
+    TIER = "reasoning"             # overridden per agent: "reasoning" | "fast"
+    AGENT_KEY = ""                 # for MODEL_OVERRIDE_<AGENT_KEY> env overrides
+    DOC_SPEC: dict | None = None   # structural expectations for produced files (doc_validator)
 
     def __init__(
         self,
@@ -102,231 +173,179 @@ class BaseAgent:
         tools: list[dict] | None = None,
         tool_handlers: dict | None = None,
         model: str | None = None,
+        max_output_tokens: int | None = None,
+        is_guest: bool = False,
     ):
         self.name = name
         self.system_prompt = system_prompt
         self.tools = tools or []
         self.tool_handlers = tool_handlers or {}
-        self.model = model or GEMINI_MODEL
+        self.is_guest = is_guest
+        # Guest (trial) sessions always run the cheapest model with a tight output cap.
+        if is_guest:
+            self.model = GUEST_GEMINI_MODEL
+            self.max_output_tokens = GUEST_MAX_OUTPUT_TOKENS
+        else:
+            self.model = model or model_for(self.TIER, self.AGENT_KEY or None)
+            self.max_output_tokens = max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS
         self.client = genai.Client(api_key=GEMINI_API_KEY)
+        # Populated by the event wrappers (event_orchestrator._wrap_tool_handlers)
+        # as files are created, so the caller gets an exact file list back.
+        self.files_created: list[str] = []
 
-    def run(self, task: str, context: str = "") -> str:
-        """Execute the agent with an agentic tool-calling loop until a final text response."""
-        user_content = task
-        if context:
-            user_content = f"Context:\n{context}\n\nTask:\n{task}"
+    # ── config helpers ───────────────────────────────────────────────────────
 
+    def _config(self, gemini_tools, phase: str, tool_config=None) -> types.GenerateContentConfig:
+        return types.GenerateContentConfig(
+            system_instruction=self.system_prompt,
+            tools=gemini_tools,
+            tool_config=tool_config,
+            thinking_config=make_thinking_config(self.model, phase),
+            max_output_tokens=self.max_output_tokens,
+        )
+
+    @staticmethod
+    def _force(names: list[str] | None = None) -> types.ToolConfig:
+        cfg = {"mode": "ANY"}
+        if names:
+            cfg["allowed_function_names"] = names
+        return types.ToolConfig(function_calling_config=types.FunctionCallingConfig(**cfg))
+
+    # ── main loop ────────────────────────────────────────────────────────────
+
+    def run(self, task: str, context: str = "") -> AgentResult:
+        user_content = f"Context:\n{context}\n\nTask:\n{task}" if context else task
         contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_content)])]
 
-        # Build config
         gemini_tools = None
         if self.tools:
             gemini_tools = [types.Tool(function_declarations=convert_tools_to_gemini(self.tools))]
 
-        # Force first call to use a tool (prevents model from answering from memory).
-        # If the agent has knowledge_search, restrict the first forced call to that
-        # tool specifically — this guarantees research happens before file generation,
-        # matching the behaviour seen when running locally in AUTO mode.
-        has_search = gemini_tools and any(
-            t["name"] == "knowledge_search" for t in self.tools
-        )
-        if has_search:
-            first_tool_config = types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(
-                    mode="ANY",
-                    allowed_function_names=["knowledge_search"],
-                )
-            )
+        tool_names = [t["name"] for t in self.tools]
+        file_tools = [n for n in tool_names if n in FILE_GEN_TOOLS]
+
+        # First call must be a tool call — research first when the agent can search.
+        if gemini_tools and "knowledge_search" in tool_names:
+            first_cfg = self._config(gemini_tools, "select", self._force(["knowledge_search"]))
         elif gemini_tools:
-            first_tool_config = types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(mode="ANY")
-            )
+            first_cfg = self._config(gemini_tools, "select", self._force())
         else:
-            first_tool_config = None
+            first_cfg = self._config(None, "work")
+        work_cfg = self._config(gemini_tools, "work")
 
-        # Thinking budgets are model-aware:
-        #   Pro models (complex docs, financial scripts, long JSON tool args):
-        #     - First call: 2 048 — enough to choose the right tool and approach
-        #     - Subsequent calls: 16 384 — full reasoning space for 9-section docs,
-        #       multi-sheet Excel scripts, and PowerPoint JSON without cutting off
-        #   Flash models (emails, RACI, short outputs):
-        #     - First call: 1 024 — lightweight tool selection
-        #     - Subsequent calls: 8 192 — sufficient for simpler structured outputs
-        is_pro = "pro" in self.model.lower()
-        thinking_cfg_first = types.ThinkingConfig(thinking_budget=2048 if is_pro else 1024)
-        thinking_cfg       = types.ThinkingConfig(thinking_budget=16384 if is_pro else 8192)
-
-        # max_output_tokens: Gemini 2.5 Pro/Flash both support up to 65 536 output tokens.
-        # Without this cap the SDK uses the model default (~8 192), which is too low
-        # for large Word documents, multi-sheet Excel scripts, or PowerPoint JSON.
-        MAX_OUTPUT_TOKENS = 65536
-
-        forced_config = types.GenerateContentConfig(
-            system_instruction=self.system_prompt,
-            tools=gemini_tools,
-            tool_config=first_tool_config,
-            thinking_config=thinking_cfg_first,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
-        )
-        # Subsequent calls use AUTO so model can give final text response
-        config = types.GenerateContentConfig(
-            system_instruction=self.system_prompt,
-            tools=gemini_tools,
-            thinking_config=thinking_cfg,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
-        )
-
-        # Tools that produce output files — the agent must call at least one
-        # of these before it is allowed to return a plain text response.
-        FILE_GEN_TOOLS = frozenset({
-            "execute_python", "create_word_document",
-            "create_excel", "create_powerpoint",
-        })
-        agent_file_tools = [t["name"] for t in self.tools if t["name"] in FILE_GEN_TOOLS]
-        file_generated = False   # flips True as soon as any file-gen tool is called
-        output_nudge_sent = False  # prevent infinite loops
-
+        file_generated = False
+        nudge_sent = False
         malformed_retries = 0
-        MAX_MALFORMED_RETRIES = 4
-        is_first_call = True
-        override_config = None   # used for the one-time forced-output call
+        continuations = 0
+        override_cfg = None
+        turn = 0
 
         while True:
-            if override_config is not None:
-                active_config = override_config
-                override_config = None
-            else:
-                active_config = forced_config if is_first_call else config
-            is_first_call = False
-            print(f"[{self.name}] Calling Gemini (forced={active_config is forced_config})", flush=True)
-            response = _generate_with_retry(self.client, self.model, contents, active_config)
+            turn += 1
+            if turn > MAX_TURNS:
+                return self._fail(f"exceeded {MAX_TURNS} model turns without finishing", file_generated)
+
+            active_cfg = override_cfg or (first_cfg if turn == 1 else work_cfg)
+            override_cfg = None
+            log.info("[%s] turn %d model=%s", self.name, turn, self.model)
+
+            try:
+                response = _generate_with_retry(self.client, self.model, contents, active_cfg)
+            except Exception as e:
+                log.exception("[%s] Gemini call failed", self.name)
+                return self._fail(f"model call failed: {e}", file_generated)
 
             candidate = response.candidates[0]
             finish_reason = str(getattr(candidate, "finish_reason", ""))
 
-            # Handle malformed function call — force a retry with a valid tool call
             if "MALFORMED_FUNCTION_CALL" in finish_reason:
                 malformed_retries += 1
-                print(f"[{self.name}] MALFORMED_FUNCTION_CALL (attempt {malformed_retries})", flush=True)
+                log.warning("[%s] MALFORMED_FUNCTION_CALL (%d)", self.name, malformed_retries)
                 if malformed_retries > MAX_MALFORMED_RETRIES:
-                    # Return a clear error string — do NOT ask for plain text, which causes
-                    # the model to write a polite summary instead of flagging the failure.
-                    print(f"[{self.name}] MALFORMED exceeded retries — returning error", flush=True)
-                    return "Error: Agent could not generate the required files due to a repeated tool formatting issue. Please try again."
-                # Retry: restrict to file-gen tools only so the model cannot fall back
-                # to knowledge_search (which was already done and wastes the retry).
-                # If no file-gen tools exist, allow any tool.
-                retry_allowed = agent_file_tools if agent_file_tools and not file_generated else None
-                retry_tool_config = types.ToolConfig(
-                    function_calling_config=types.FunctionCallingConfig(
-                        mode="ANY",
-                        **({"allowed_function_names": retry_allowed} if retry_allowed else {}),
-                    )
-                )
-                forced_retry_config = types.GenerateContentConfig(
-                    system_instruction=self.system_prompt,
-                    tools=gemini_tools,
-                    tool_config=retry_tool_config,
-                    thinking_config=thinking_cfg,
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
-                )
+                    return self._fail("repeated malformed tool calls", file_generated)
+                retry_allowed = file_tools if file_tools and not file_generated else None
                 contents.append(types.Content(role="user", parts=[types.Part.from_text(
-                    text=(
-                        "Your previous tool call had malformed JSON arguments — this is usually caused by "
-                        "a Python code string that is too long or contains syntax errors. "
-                        "Call execute_python again with valid JSON. Tips to avoid the error:\n"
-                        "- Split into two separate execute_python calls (one for Excel, one for Word)\n"
-                        "- Inside f-strings use single quotes for dict keys: f\"{row['cost']:.2f}\" not f\"{row[\\\"cost\\\"]:.2f}\"\n"
-                        "- Avoid deeply nested expressions in f-strings"
-                    )
-                )]))
-                override_config = forced_retry_config
+                    text=self._malformed_hint(file_tools))]))
+                override_cfg = self._config(gemini_tools, "work", self._force(retry_allowed))
                 continue
 
-            # Guard: output truncated — model hit the token cap mid-generation.
-            # This causes cut-off sentences and missing document sections.
-            # Inject a continuation prompt so the model resumes where it left off.
             if "MAX_TOKENS" in finish_reason:
-                print(f"[{self.name}] MAX_TOKENS hit — injecting continuation prompt", flush=True)
+                continuations += 1
+                log.warning("[%s] MAX_TOKENS hit (%d)", self.name, continuations)
+                if continuations > MAX_CONTINUATIONS:
+                    return self._fail("output repeatedly exceeded the token limit", file_generated)
                 if candidate.content and candidate.content.parts:
                     contents.append(candidate.content)
-                contents.append(types.Content(role="user", parts=[types.Part.from_text(
-                    text=(
-                        "Your previous response was cut off because it reached the output limit. "
-                        "Continue exactly where you left off — do not repeat any content already written. "
-                        "Complete all remaining sections and ensure every required section is fully written."
-                    )
-                )]))
+                contents.append(types.Content(role="user", parts=[types.Part.from_text(text=(
+                    "Your previous response was cut off at the output limit. If you were in the "
+                    "middle of a tool call, issue the tool call again in full, splitting the work into "
+                    "smaller calls. If you were writing text, continue exactly where you left off "
+                    "without repeating content."
+                ))]))
                 continue
 
-            # Guard: content can be None if the response was blocked or empty
             if candidate.content is None or not candidate.content.parts:
-                return f"[Agent stopped: finish_reason={finish_reason}]"
+                return self._fail(f"model returned no content (finish_reason={finish_reason})", file_generated)
 
-            # Append the assistant response to conversation
             contents.append(candidate.content)
-
-            # Check if any part has a function_call
-            function_calls = [
-                part for part in candidate.content.parts if part.function_call
-            ]
+            function_calls = [p for p in candidate.content.parts if p.function_call]
 
             if not function_calls:
-                # If this agent is supposed to produce files but hasn't yet,
-                # inject one forced call so it can't slip away with just text.
-                if agent_file_tools and not file_generated and not output_nudge_sent:
-                    output_nudge_sent = True
-                    nudge = (
-                        "You have not yet generated any output files. "
-                        "You MUST call one of the file-generation tools now "
-                        f"({', '.join(agent_file_tools)}) to produce the required deliverables. "
-                        "Do NOT respond with text — call the tool directly."
-                    )
-                    contents.append(types.Content(
-                        role="user",
-                        parts=[types.Part.from_text(text=nudge)],
-                    ))
-                    override_config = types.GenerateContentConfig(
-                        system_instruction=self.system_prompt,
-                        tools=gemini_tools,
-                        tool_config=types.ToolConfig(
-                            function_calling_config=types.FunctionCallingConfig(
-                                mode="ANY",
-                                allowed_function_names=agent_file_tools,
-                            )
-                        ),
-                        thinking_config=thinking_cfg,
-                        max_output_tokens=MAX_OUTPUT_TOKENS,
-                    )
-                    continue  # loop back with forced file-generation call
+                if file_tools and not file_generated and not nudge_sent:
+                    nudge_sent = True
+                    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=(
+                        "You have not yet generated any output files. You MUST call one of the "
+                        f"file-generation tools now ({', '.join(file_tools)}) to produce the required "
+                        "deliverables. Do NOT respond with text — call the tool directly."
+                    ))]))
+                    override_cfg = self._config(gemini_tools, "work", self._force(file_tools))
+                    continue
+                text = "".join(p.text for p in candidate.content.parts if p.text)
+                if file_tools and not file_generated:
+                    return self._fail("agent finished without producing any file", file_generated, text)
+                return AgentResult(text=text, files=list(self.files_created))
 
-                # No more tool calls — extract and return text
-                return "".join(
-                    part.text for part in candidate.content.parts if part.text
-                )
-
-            # Successful tool call round — reset the malformed counter so transient
-            # MALFORMED errors on one tool don't bleed into future calls.
             malformed_retries = 0
-
-            # Process each function call and add results
-            function_response_parts = []
+            response_parts = []
             for part in function_calls:
                 fc = part.function_call
-                if fc.name in FILE_GEN_TOOLS:
-                    file_generated = True
-                print(f"[{self.name}] Tool call: {fc.name}", flush=True)
                 handler = self.tool_handlers.get(fc.name)
+                log.info("[%s] tool call: %s", self.name, fc.name)
                 if handler:
-                    result = handler(**dict(fc.args))
+                    try:
+                        result = handler(**dict(fc.args))
+                    except Exception as e:
+                        log.exception("[%s] tool %s raised", self.name, fc.name)
+                        result = json.dumps({"error": f"{type(e).__name__}: {e}"})
                 else:
-                    result = f"Error: No handler registered for tool '{fc.name}'"
-                print(f"[{self.name}] Tool result ({fc.name}): {str(result)[:150]}", flush=True)
-                function_response_parts.append(
-                    types.Part.from_function_response(
-                        name=fc.name,
-                        response={"result": str(result)},
-                    )
-                )
+                    result = json.dumps({"error": f"No handler registered for tool '{fc.name}'"})
+                result_str = str(result)
+                if fc.name in FILE_GEN_TOOLS and tool_result_ok(fc.name, result_str):
+                    file_generated = True
+                log.info("[%s] tool result (%s): %.150s", self.name, fc.name, result_str)
+                response_parts.append(types.Part.from_function_response(
+                    name=fc.name, response={"result": result_str},
+                ))
+            contents.append(types.Content(role="user", parts=response_parts))
 
-            contents.append(types.Content(role="user", parts=function_response_parts))
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _fail(self, reason: str, file_generated: bool, text: str = "") -> AgentResult:
+        log.error("[%s] failed: %s", self.name, reason)
+        # A partial run may still have produced usable files — report them honestly.
+        return AgentResult(text=text, files=list(self.files_created), status="failed", error=reason)
+
+    @staticmethod
+    def _malformed_hint(file_tools: list[str]) -> str:
+        if "execute_python" in file_tools:
+            return (
+                "Your previous tool call had malformed JSON arguments — usually a Python code string "
+                "that is too long or contains syntax errors. Call execute_python again with valid JSON. "
+                "Tips: split into two smaller execute_python calls (e.g. one for Excel, one for Word); "
+                "inside f-strings use single quotes for dict keys; avoid deeply nested f-string expressions."
+            )
+        return (
+            "Your previous tool call had malformed JSON arguments. Call the tool again with valid, "
+            "well-formed JSON — keep strings free of unescaped quotes and newlines, and if the content "
+            "is very long, reduce it or split it across two calls."
+        )

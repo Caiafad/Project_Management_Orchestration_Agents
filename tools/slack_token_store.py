@@ -1,10 +1,11 @@
 """
-Per-user Gmail OAuth token storage backed by Google Cloud Storage.
+Per-user Slack OAuth token storage backed by Google Cloud Storage.
 
-Tokens are stored as JSON at:  gs://<BUCKET>/tokens/<username>.json
+Mirrors tools/gmail_token_store.py. Tokens live in the same bucket under a
+separate prefix:  gs://<BUCKET>/slack-tokens/<username>.json
 
-The Cloud Run service account (roles/storage.objectAdmin on the bucket)
-provides credentials automatically — no extra auth setup needed.
+Stored dict is the relevant subset of Slack's oauth.v2.access response:
+  {"access_token": "xoxb-...", "team_id": "...", "team_name": "...", "bot_user_id": "..."}
 """
 
 import json
@@ -15,11 +16,10 @@ BUCKET_NAME = os.environ.get("GMAIL_TOKEN_BUCKET", "pm-agent-gmail-tokens")
 
 def _blob(username: str):
     from google.cloud import storage
-    return storage.Client().bucket(BUCKET_NAME).blob(f"tokens/{username}.json")
+    return storage.Client().bucket(BUCKET_NAME).blob(f"slack-tokens/{username}.json")
 
 
 def load_token(username: str) -> dict | None:
-    """Return stored token dict for user, or None if not found."""
     try:
         blob = _blob(username)
         if not blob.exists():
@@ -30,14 +30,12 @@ def load_token(username: str) -> dict | None:
 
 
 def save_token(username: str, token_dict: dict):
-    """Write token dict for user to GCS."""
     _blob(username).upload_from_string(
         json.dumps(token_dict), content_type="application/json"
     )
 
 
 def has_token(username: str) -> bool:
-    """Return True if user has a stored token."""
     try:
         return _blob(username).exists()
     except Exception:
@@ -45,7 +43,6 @@ def has_token(username: str) -> bool:
 
 
 def delete_token(username: str) -> bool:
-    """Delete the user's stored token. Returns True if one was removed."""
     try:
         blob = _blob(username)
         if blob.exists():

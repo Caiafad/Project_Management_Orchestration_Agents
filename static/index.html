@@ -24,6 +24,10 @@
         </div>
       </div>
       <div class="header-right">
+        <div class="trial-badge" id="trial-badge" hidden>
+          <i class="fas fa-flask"></i>
+          <span id="trial-badge-text">Trial</span>
+        </div>
         <div class="connection-badge" id="connection-badge">
           <span class="conn-dot" id="conn-dot"></span>
           <span id="conn-label">Connecting...</span>
@@ -65,14 +69,25 @@
           <div class="proj-docs-status" id="proj-docs-status"></div>
         </div>
 
-        <!-- Gmail connect — pinned to bottom of sidebar -->
+        <!-- Gmail + Slack connect — pinned to bottom of sidebar -->
         <div class="gmail-section">
-          <div class="panel-label">YOUR EMAIL</div>
-          <button class="gmail-btn" id="gmail-btn" onclick="connectGmail()">
-            <i class="fab fa-google gmail-icon"></i>
-            <span id="gmail-btn-text">Connect Gmail</span>
-          </button>
-          <div class="gmail-status-text" id="gmail-status-text">Not connected</div>
+          <div class="panel-label">YOUR COMMUNICATIONS</div>
+          <div class="comms-grid">
+            <div>
+              <button class="gmail-btn" id="gmail-btn" onclick="connectGmail()">
+                <i class="fab fa-google gmail-icon"></i>
+                <span id="gmail-btn-text">Gmail</span>
+              </button>
+              <div class="gmail-status-text" id="gmail-status-text">Not connected</div>
+            </div>
+            <div>
+              <button class="gmail-btn" id="slack-btn" onclick="connectSlack()">
+                <i class="fab fa-slack gmail-icon"></i>
+                <span id="slack-btn-text">Slack</span>
+              </button>
+              <div class="gmail-status-text" id="slack-status-text">Not connected</div>
+            </div>
+          </div>
         </div>
       </aside>
 

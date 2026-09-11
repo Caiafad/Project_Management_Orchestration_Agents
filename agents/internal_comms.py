@@ -103,16 +103,16 @@ TOOLS = [
 
 
 class InternalCommsAgent(BaseAgent):
-    def __init__(self, username: str = None):
+    def __init__(self, username: str = None, is_guest: bool = False):
         from tools.gmail_tools import send_email, read_emails, search_emails
 
         tool_handlers = {
             "send_email":         lambda to, subject, body, **_:      send_email(to, subject, body, username=username),
             "read_emails":        lambda max_results=10, query="", **_: read_emails(max_results, query, username=username),
             "search_emails":      lambda query, max_results=10, **_:  search_emails(query, max_results, username=username),
-            "send_slack_message": lambda channel, text, **_:          send_slack_message(channel, text),
-            "send_slack_dm":      lambda user_id, text, **_:          send_slack_dm(user_id, text),
-            "list_slack_channels":lambda **_:                          list_slack_channels(),
+            "send_slack_message": lambda channel, text, **_:          send_slack_message(channel, text, username=username),
+            "send_slack_dm":      lambda user_id, text, **_:          send_slack_dm(user_id, text, username=username),
+            "list_slack_channels":lambda **_:                          list_slack_channels(username=username),
         }
 
         super().__init__(
@@ -121,4 +121,5 @@ class InternalCommsAgent(BaseAgent):
             tools=TOOLS,
             tool_handlers=tool_handlers,
             model=AGENT_MODEL,
+            is_guest=is_guest,
         )
