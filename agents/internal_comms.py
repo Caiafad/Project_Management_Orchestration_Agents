@@ -1,7 +1,6 @@
 from agents.base_agent import BaseAgent
 from tools.slack_tools import send_slack_message, send_slack_dm, list_slack_channels
 
-AGENT_MODEL = "gemini-2.5-flash"
 
 SYSTEM_PROMPT = """You are the Internal Communications Agent — an expert scrum master and internal team communications specialist.
 
@@ -103,6 +102,9 @@ TOOLS = [
 
 
 class InternalCommsAgent(BaseAgent):
+    TIER = "fast"
+    AGENT_KEY = "INTERNAL_COMMS"
+
     def __init__(self, username: str = None, is_guest: bool = False):
         from tools.gmail_tools import send_email, read_emails, search_emails
 
@@ -120,6 +122,5 @@ class InternalCommsAgent(BaseAgent):
             system_prompt=SYSTEM_PROMPT,
             tools=TOOLS,
             tool_handlers=tool_handlers,
-            model=AGENT_MODEL,
             is_guest=is_guest,
         )

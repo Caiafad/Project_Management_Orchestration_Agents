@@ -1,6 +1,5 @@
 from agents.base_agent import BaseAgent
 
-AGENT_MODEL = "gemini-2.5-flash"
 
 SYSTEM_PROMPT = """You are the External Communications Agent — an expert in professional external stakeholder communications.
 
@@ -83,6 +82,9 @@ TOOLS = [
 
 
 class ExternalCommsAgent(BaseAgent):
+    TIER = "fast"
+    AGENT_KEY = "EXTERNAL_COMMS"
+
     def __init__(self, username: str = None, is_guest: bool = False):
         from tools.gmail_tools import send_email, read_emails, search_emails, draft_email
 
@@ -98,6 +100,5 @@ class ExternalCommsAgent(BaseAgent):
             system_prompt=SYSTEM_PROMPT,
             tools=TOOLS,
             tool_handlers=tool_handlers,
-            model=AGENT_MODEL,
             is_guest=is_guest,
         )

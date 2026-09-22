@@ -16,7 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from google import genai
 from google.genai import types
 from config import GEMINI_API_KEY, GEMINI_MODEL, GUEST_GEMINI_MODEL
-from agents.base_agent import convert_tools_to_gemini, _generate_with_retry
+from agents.base_agent import (
+    convert_tools_to_gemini, _generate_with_retry, make_thinking_config, DEFAULT_MAX_OUTPUT_TOKENS,
+)
 from orchestrator import ORCHESTRATOR_SYSTEM_PROMPT, ORCHESTRATOR_TOOLS
 
 # Metadata for each agent — used by the frontend for display
@@ -231,7 +233,8 @@ class EventOrchestrator:
         self.config = types.GenerateContentConfig(
             system_instruction=ORCHESTRATOR_SYSTEM_PROMPT,
             tools=self.gemini_tools,
-            thinking_config=types.ThinkingConfig(thinking_budget=2048),
+            thinking_config=make_thinking_config(self.model, "select"),
+            max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
         )
 
     def _delegate_handler(self, tool_name: str):
@@ -277,7 +280,8 @@ class EventOrchestrator:
             tool_config=types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(mode="ANY")
             ),
-            thinking_config=types.ThinkingConfig(thinking_budget=2048),
+            thinking_config=make_thinking_config(self.model, "select"),
+            max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
         )
 
         is_first_call = True

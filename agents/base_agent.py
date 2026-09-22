@@ -88,10 +88,13 @@ def model_generation(model: str) -> int:
 
 def make_thinking_config(model: str, phase: str) -> types.ThinkingConfig:
     """phase: 'select' (choose a tool) or 'work' (produce the long output).
-    Gemini 3.x uses thinking_level; 2.5 uses a token budget."""
+    Gemini 3.x uses thinking_level; 2.5 uses a token budget. Flash on Gemini 3 stays
+    at medium: at high it thinks for 20-35k tokens and overflows the output cap."""
     heavy = "pro" in model.lower()
     if model_generation(model) >= 3:
-        return types.ThinkingConfig(thinking_level="low" if phase == "select" else "high")
+        if phase == "select":
+            return types.ThinkingConfig(thinking_level="low")
+        return types.ThinkingConfig(thinking_level="high" if heavy else "medium")
     if phase == "select":
         return types.ThinkingConfig(thinking_budget=2048 if heavy else 1024)
     return types.ThinkingConfig(thinking_budget=16384 if heavy else 8192)
@@ -337,15 +340,17 @@ class BaseAgent:
 
     @staticmethod
     def _malformed_hint(file_tools: list[str]) -> str:
+        # On Gemini 3 a MALFORMED_FUNCTION_CALL is almost always a tool call that was
+        # cut off at the output limit, so the fix is a smaller call, not "fix the JSON".
         if "execute_python" in file_tools:
             return (
-                "Your previous tool call had malformed JSON arguments — usually a Python code string "
-                "that is too long or contains syntax errors. Call execute_python again with valid JSON. "
-                "Tips: split into two smaller execute_python calls (e.g. one for Excel, one for Word); "
-                "inside f-strings use single quotes for dict keys; avoid deeply nested f-string expressions."
+                "Your previous tool call was cut off before it completed — the code string was too "
+                "long for a single call. Call execute_python again with a SHORTER script: split the "
+                "work into two or more calls (e.g. one for the Excel workbook, one for the Word "
+                "document), and rely on the provided helper functions instead of writing styling by hand."
             )
         return (
-            "Your previous tool call had malformed JSON arguments. Call the tool again with valid, "
-            "well-formed JSON — keep strings free of unescaped quotes and newlines, and if the content "
-            "is very long, reduce it or split it across two calls."
+            "Your previous tool call was cut off before it completed — the arguments were too long "
+            "for a single call. Call the tool again with a smaller payload: fewer or shorter sections, "
+            "or split the document across two calls. Keep the JSON well-formed."
         )

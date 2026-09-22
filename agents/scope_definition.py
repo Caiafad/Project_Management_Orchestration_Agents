@@ -1,8 +1,6 @@
 from agents.base_agent import BaseAgent
+from agents import tool_specs
 
-AGENT_MODEL = "gemini-2.5-pro"
-from tools.document_generator import create_word_document
-from tools.vertex_search import vertex_search
 
 SYSTEM_PROMPT = """You are the Scope Definition Agent — an expert in defining project scope and producing formal requirements documentation.
 
@@ -102,50 +100,22 @@ DOCUMENT RULES — non-negotiable:
   If you find yourself about to submit a document without them, stop and add them first."""
 
 TOOLS = [
-    {
-        "name": "knowledge_search",
-        "description": "Search the knowledge base and uploaded project documents for client requirements, industry standards, compliance frameworks, scope templates, and project context relevant to scope definition.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "num_results": {"type": "integer", "description": "Number of results (max 10)", "default": 5},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "create_word_document",
-        "description": "Create a professional Word document (.docx) for BRDs, scope definition documents, or requirements specifications.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Document title"},
-                "sections": {
-                    "type": "string",
-                    "description": 'JSON string of sections. Each section: {"heading": str, "level": int, "content": str, "bullet_points": [str], "table": {"headers": [str], "rows": [[str]]}}',
-                },
-                "filename": {"type": "string", "description": "Output filename without extension", "default": ""},
-                "include_toc": {"type": "boolean", "description": "Include table of contents", "default": False},
-            },
-            "required": ["title", "sections"],
-        },
-    },
+    tool_specs.knowledge_search('Search the knowledge base and uploaded project documents for client requirements, industry standards, compliance frameworks, scope templates, and project context relevant to scope definition.'),
+    tool_specs.create_word_document('Create a professional Word document (.docx) for BRDs, scope definition documents, or requirements specifications.'),
 ]
 
-TOOL_HANDLERS = {
-    "knowledge_search": lambda query, num_results=5, username=None, **_: vertex_search(query, num_results, username=username),
-    "create_word_document": lambda **kwargs: create_word_document(**kwargs),
-}
+TOOL_HANDLERS = tool_specs.standard_handlers([t['name'] for t in TOOLS])
 
 
 class ScopeDefinitionAgent(BaseAgent):
+    TIER = "reasoning"
+    AGENT_KEY = "SCOPE_DEFINITION"
+
     def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Scope Definition Agent",
             system_prompt=SYSTEM_PROMPT,
             tools=TOOLS,
             tool_handlers=TOOL_HANDLERS,
-            model=AGENT_MODEL,
             is_guest=is_guest,
         )

@@ -93,9 +93,41 @@ def _docx_apply_standard_formatting(doc, title: str):
     ftr_para.add_run(" | Confidential").font.size = Pt(8)
 
 
+def _parse_structured(value, label: str):
+    """Accept a list (structured tool args) or a JSON string (legacy callers).
+    Returns (data, error_json_or_None)."""
+    if isinstance(value, (list, tuple)):
+        return list(value), None
+    if isinstance(value, dict):
+        return [value], None
+    try:
+        data = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as e:
+        return None, json.dumps({"error": f"Invalid {label} JSON: {e}"})
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return None, json.dumps({"error": f"{label} must be a list"})
+    return data, None
+
+
+def _coerce_cell(value):
+    """Excel cells: turn numeric-looking strings into real numbers so formulas work."""
+    if isinstance(value, str):
+        s = value.strip().replace(",", "")
+        if s.startswith("$"):
+            s = s[1:]
+        try:
+            if s and s.lstrip("-").replace(".", "", 1).isdigit():
+                return float(s) if "." in s else int(s)
+        except ValueError:
+            pass
+    return value
+
+
 def create_word_document(
     title: str,
-    sections: str,
+    sections,
     filename: str = "",
     include_toc: bool = False,   # kept for backwards compat; TOC is auto-omitted
 ) -> str:
@@ -116,10 +148,9 @@ def create_word_document(
     Returns:
         JSON string with the file path of the created document.
     """
-    try:
-        sections_data = json.loads(sections)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid sections JSON: {e}"})
+    sections_data, err = _parse_structured(sections, "sections")
+    if err:
+        return err
 
     # Defensive: if the agent passed an empty title, pull it from the first section heading
     if not title or not title.strip():
@@ -216,7 +247,7 @@ def create_word_document(
 
 def create_powerpoint(
     title: str,
-    slides: str,
+    slides,
     filename: str = "",
 ) -> str:
     """
@@ -232,10 +263,9 @@ def create_powerpoint(
       - "left"  / "right" (dict): {"bullet_points":[str]} — layout="two_column"
       - "notes"        (str)  : Speaker notes
     """
-    try:
-        slides_data = json.loads(slides)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid slides JSON: {e}"})
+    slides_data, err = _parse_structured(slides, "slides")
+    if err:
+        return err
 
     # ── Colour palette ──────────────────────────────────────────────
     # Each PptxRGBColor takes three 0-255 integers (R, G, B)
@@ -473,7 +503,7 @@ def create_powerpoint(
 
 def create_excel(
     title: str,
-    sheets: str,
+    sheets,
     filename: str = "",
 ) -> str:
     """
@@ -493,10 +523,9 @@ def create_excel(
     Returns:
         JSON string with the file path of the created workbook.
     """
-    try:
-        sheets_data = json.loads(sheets)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid sheets JSON: {e}"})
+    sheets_data, err = _parse_structured(sheets, "sheets")
+    if err:
+        return err
 
     wb = Workbook()
 
@@ -536,7 +565,8 @@ def create_excel(
 
         # Write data rows
         for row_idx, row_data in enumerate(rows, start=2):
-            for col_idx, cell_value in enumerate(row_data, start=1):
+            for col_idx, raw_value in enumerate(row_data, start=1):
+                cell_value = _coerce_cell(raw_value)
                 cell = ws.cell(row=row_idx, column=col_idx, value=cell_value)
                 cell.border = thin_border
                 cell.alignment = Alignment(vertical="center")

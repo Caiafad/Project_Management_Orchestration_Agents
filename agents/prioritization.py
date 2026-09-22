@@ -1,10 +1,6 @@
 from agents.base_agent import BaseAgent
+from agents import tool_specs
 
-AGENT_MODEL = "gemini-2.5-flash"
-from tools.python_executor import execute_python
-from tools.document_generator import create_word_document, create_excel
-from tools.file_reader import read_output_file
-from tools.vertex_search import vertex_search
 
 SYSTEM_PROMPT = """You are the Prioritization Agent — an expert in work prioritization frameworks, decision matrices, and strategic sequencing of project work.
 
@@ -62,97 +58,25 @@ When building prioritization frameworks:
 Format all outputs with clear rankings, scoring breakdowns, and actionable sequencing recommendations."""
 
 TOOLS = [
-    {
-        "name": "knowledge_search",
-        "description": "Search the knowledge base and uploaded project documents for project details, backlog items, strategic objectives, business priorities, dependencies, and any context needed to produce accurate priority rankings.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "num_results": {"type": "integer", "description": "Number of results (max 10)", "default": 5},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "execute_python",
-        "description": "Execute Python code for priority scoring calculations, weighted models, sensitivity analysis, sorting, and data processing.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Python code to execute",
-                }
-            },
-            "required": ["code"],
-        },
-    },
-    {
-        "name": "create_word_document",
-        "description": "Create a professional Word document (.docx) for prioritization reports, framework documentation, and executive priority summaries.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Document title"},
-                "sections": {
-                    "type": "string",
-                    "description": 'JSON string of sections. Each section: {"heading": str, "level": int, "content": str, "bullet_points": [str], "table": {"headers": [str], "rows": [[str]]}}',
-                },
-                "filename": {"type": "string", "description": "Output filename without extension", "default": ""},
-                "include_toc": {"type": "boolean", "description": "Include table of contents", "default": False},
-            },
-            "required": ["title", "sections"],
-        },
-    },
-    {
-        "name": "create_excel",
-        "description": "Create an Excel spreadsheet (.xlsx) for priority scoring matrices, ranked backlogs, value-vs-effort grids, and weighted scoring models.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Workbook title"},
-                "sheets": {
-                    "type": "string",
-                    "description": 'JSON string of sheets. Each sheet: {"name": str, "headers": [str], "rows": [[values]], "column_widths": [int], "formulas": [{"cell": "C10", "formula": "=SUM(C2:C9)"}], "freeze_panes": "A2"}',
-                },
-                "filename": {"type": "string", "description": "Output filename without extension", "default": ""},
-            },
-            "required": ["title", "sheets"],
-        },
-    },
-    {
-        "name": "read_output_file",
-        "description": "Read the content of a previously generated output file (.xlsx, .docx, or .pptx) to verify scores, cross-reference priority rankings, or audit previously created files.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "filename": {
-                    "type": "string",
-                    "description": "The filename with extension (e.g. 'Priority_Matrix.xlsx'). Only files in the output folder can be read.",
-                }
-            },
-            "required": ["filename"],
-        },
-    },
+    tool_specs.knowledge_search('Search the knowledge base and uploaded project documents for project details, backlog items, strategic objectives, business priorities, dependencies, and any context needed to produce accurate priority rankings.'),
+    tool_specs.execute_python('Execute Python code for priority scoring calculations, weighted models, sensitivity analysis, sorting, and data processing.'),
+    tool_specs.create_word_document('Create a professional Word document (.docx) for prioritization reports, framework documentation, and executive priority summaries.'),
+    tool_specs.create_excel('Create an Excel spreadsheet (.xlsx) for priority scoring matrices, ranked backlogs, value-vs-effort grids, and weighted scoring models.'),
+    tool_specs.read_output_file('Read the content of a previously generated output file (.xlsx, .docx, or .pptx) to verify scores, cross-reference priority rankings, or audit previously created files.'),
 ]
 
-TOOL_HANDLERS = {
-    "knowledge_search": lambda query, num_results=5, username=None, **_: vertex_search(query, num_results, username=username),
-    "execute_python": lambda code, **_: execute_python(code),
-    "create_word_document": lambda **kwargs: create_word_document(**kwargs),
-    "create_excel": lambda **kwargs: create_excel(**kwargs),
-    "read_output_file": lambda filename, **_: read_output_file(filename),
-}
+TOOL_HANDLERS = tool_specs.standard_handlers([t['name'] for t in TOOLS])
 
 
 class PrioritizationAgent(BaseAgent):
+    TIER = "fast"
+    AGENT_KEY = "PRIORITIZATION"
+
     def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Prioritization Agent",
             system_prompt=SYSTEM_PROMPT,
             tools=TOOLS,
             tool_handlers=TOOL_HANDLERS,
-            model=AGENT_MODEL,
             is_guest=is_guest,
         )

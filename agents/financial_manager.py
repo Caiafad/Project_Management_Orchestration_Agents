@@ -1,10 +1,6 @@
 from agents.base_agent import BaseAgent
+from agents import tool_specs
 
-AGENT_MODEL = "gemini-2.5-pro"
-from tools.python_executor import execute_python
-from tools.vertex_search import vertex_search
-from tools.document_generator import create_word_document, create_excel
-from tools.file_reader import read_output_file
 
 SYSTEM_PROMPT = """You are the Financial Manager Agent — an expert in project financial planning, cost analysis, and budget management.
 
@@ -310,104 +306,25 @@ WORD TABLE FORMATTING RULES:
 Format all financial documents with clear tables, summaries, and supporting calculations."""
 
 TOOLS = [
-    {
-        "name": "execute_python",
-        "description": "Execute Python code for financial calculations, budget modeling, ROI analysis, NPV calculations, and data processing.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Python code to execute",
-                }
-            },
-            "required": ["code"],
-        },
-    },
-    {
-        "name": "knowledge_search",
-        "description": "Search the project management knowledge base for market rates, cost benchmarks, financial best practices, and industry pricing data.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query for the knowledge base",
-                },
-                "num_results": {
-                    "type": "integer",
-                    "description": "Number of results (max 10)",
-                    "default": 5,
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "create_word_document",
-        "description": "Create a professional Word document (.docx) for budget reports, cost analyses, and financial documentation.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Document title"},
-                "sections": {
-                    "type": "string",
-                    "description": 'JSON string of sections. Each section: {"heading": str, "level": int, "content": str, "bullet_points": [str], "table": {"headers": [str], "rows": [[str]]}}',
-                },
-                "filename": {"type": "string", "description": "Output filename without extension", "default": ""},
-                "include_toc": {"type": "boolean", "description": "Include table of contents", "default": False},
-            },
-            "required": ["title", "sections"],
-        },
-    },
-    {
-        "name": "create_excel",
-        "description": "Create an Excel spreadsheet (.xlsx) for budgets, cost breakdowns, financial projections, ROI models, and billing trackers.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Workbook title"},
-                "sheets": {
-                    "type": "string",
-                    "description": 'JSON string of sheets. Each sheet: {"name": str, "headers": [str], "rows": [[values]], "column_widths": [int], "formulas": [{"cell": "C10", "formula": "=SUM(C2:C9)"}], "freeze_panes": "A2"}',
-                },
-                "filename": {"type": "string", "description": "Output filename without extension", "default": ""},
-            },
-            "required": ["title", "sheets"],
-        },
-    },
-    {
-        "name": "read_output_file",
-        "description": "Read the content of a previously generated output file (.xlsx, .docx, or .pptx). Use this to verify numbers, cross-reference two documents, or audit data in any file you have created.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "filename": {
-                    "type": "string",
-                    "description": "The filename with extension (e.g. 'Project_Financial_Plan.xlsx'). Only files in the output folder can be read.",
-                }
-            },
-            "required": ["filename"],
-        },
-    },
+    tool_specs.execute_python('Execute Python code for financial calculations, budget modeling, ROI analysis, NPV calculations, and data processing.'),
+    tool_specs.knowledge_search('Search the project management knowledge base for market rates, cost benchmarks, financial best practices, and industry pricing data.'),
+    tool_specs.create_word_document('Create a professional Word document (.docx) for budget reports, cost analyses, and financial documentation.'),
+    tool_specs.create_excel('Create an Excel spreadsheet (.xlsx) for budgets, cost breakdowns, financial projections, ROI models, and billing trackers.'),
+    tool_specs.read_output_file('Read the content of a previously generated output file (.xlsx, .docx, or .pptx). Use this to verify numbers, cross-reference two documents, or audit data in any file you have created.'),
 ]
 
-TOOL_HANDLERS = {
-    "execute_python": lambda code, **_: execute_python(code),
-    "knowledge_search": lambda query, num_results=5, username=None, **_: vertex_search(query, num_results, username=username),
-    "create_word_document": lambda **kwargs: create_word_document(**kwargs),
-    "create_excel": lambda **kwargs: create_excel(**kwargs),
-    "read_output_file": lambda filename, **_: read_output_file(filename),
-}
+TOOL_HANDLERS = tool_specs.standard_handlers([t['name'] for t in TOOLS])
 
 
 class FinancialManagerAgent(BaseAgent):
+    TIER = "reasoning"
+    AGENT_KEY = "FINANCIAL_MANAGER"
+
     def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Financial Manager Agent",
             system_prompt=SYSTEM_PROMPT,
             tools=TOOLS,
             tool_handlers=TOOL_HANDLERS,
-            model=AGENT_MODEL,
             is_guest=is_guest,
         )

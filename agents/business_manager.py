@@ -1,10 +1,6 @@
 from agents.base_agent import BaseAgent
+from agents import tool_specs
 
-AGENT_MODEL = "gemini-2.5-pro"
-from tools.document_generator import create_word_document, create_powerpoint
-from tools.python_executor import execute_python
-from tools.file_reader import read_output_file
-from tools.vertex_search import vertex_search
 
 SYSTEM_PROMPT = """You are the Business Manager Agent — an expert in executive communications, presentations, and roadmap development.
 
@@ -127,91 +123,25 @@ Period label: choose automatically — "Week" < 6 months, "Month" 6–18 months,
 Place the Gantt slide after the Timeline/Roadmap section slide in the deck."""
 
 TOOLS = [
-    {
-        "name": "knowledge_search",
-        "description": "Search the knowledge base and uploaded project documents for project briefs, business context, strategic goals, financial summaries, roadmaps, and executive-level project information.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "num_results": {"type": "integer", "description": "Number of results (max 10)", "default": 5},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "create_powerpoint",
-        "description": "Create a professional PowerPoint presentation (.pptx) for executive briefings, project roadmaps, and stakeholder presentations.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Presentation title"},
-                "slides": {
-                    "type": "string",
-                    "description": 'JSON string of slides. Layouts: "content" (bullet_points:[str], max 5), "metrics" (metrics:[{"icon":str,"label":str,"value":str}]), "table" (table:{"headers":[str],"rows":[[str]]}), "two_column" (left:{"heading":str,"bullet_points":[str]}, right:{...}), "section" (divider, content=subtitle), "blank". Always include "notes" for speaker notes.',
-                },
-                "filename": {"type": "string", "description": "Output filename without extension", "default": ""},
-            },
-            "required": ["title", "slides"],
-        },
-    },
-    {
-        "name": "execute_python",
-        "description": "Run Python code using python-pptx or python-docx to build complex presentations or documents. Use this when adding a Gantt chart slide (pptx_gantt_slide helper is pre-injected) or when create_powerpoint cannot handle the required complexity.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Python code to execute"}
-            },
-            "required": ["code"],
-        },
-    },
-    {
-        "name": "read_output_file",
-        "description": "Read a previously generated .xlsx, .docx, or .pptx file from the output folder to extract data for use in a presentation.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "filename": {"type": "string", "description": "Filename with extension in the output folder"}
-            },
-            "required": ["filename"],
-        },
-    },
-    {
-        "name": "create_word_document",
-        "description": "Create a professional Word document (.docx) for executive briefs, written roadmaps, or detailed reports.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Document title"},
-                "sections": {
-                    "type": "string",
-                    "description": 'JSON string of sections. Each section: {"heading": str, "level": int, "content": str, "bullet_points": [str], "table": {"headers": [str], "rows": [[str]]}}',
-                },
-                "filename": {"type": "string", "description": "Output filename without extension", "default": ""},
-                "include_toc": {"type": "boolean", "description": "Include table of contents", "default": False},
-            },
-            "required": ["title", "sections"],
-        },
-    },
+    tool_specs.knowledge_search('Search the knowledge base and uploaded project documents for project briefs, business context, strategic goals, financial summaries, roadmaps, and executive-level project information.'),
+    tool_specs.create_powerpoint('Create a professional PowerPoint presentation (.pptx) for executive briefings, project roadmaps, and stakeholder presentations.'),
+    tool_specs.execute_python('Run Python code using python-pptx or python-docx to build complex presentations or documents. Use this when adding a Gantt chart slide (pptx_gantt_slide helper is pre-injected) or when create_powerpoint cannot handle the required complexity.'),
+    tool_specs.read_output_file('Read a previously generated .xlsx, .docx, or .pptx file from the output folder to extract data for use in a presentation.'),
+    tool_specs.create_word_document('Create a professional Word document (.docx) for executive briefs, written roadmaps, or detailed reports.'),
 ]
 
-TOOL_HANDLERS = {
-    "knowledge_search": lambda query, num_results=5, username=None, **_: vertex_search(query, num_results, username=username),
-    "create_powerpoint": lambda **kwargs: create_powerpoint(**kwargs),
-    "create_word_document": lambda **kwargs: create_word_document(**kwargs),
-    "execute_python": lambda code, **_: execute_python(code),
-    "read_output_file": lambda filename, **_: read_output_file(filename),
-}
+TOOL_HANDLERS = tool_specs.standard_handlers([t['name'] for t in TOOLS])
 
 
 class BusinessManagerAgent(BaseAgent):
+    TIER = "reasoning"
+    AGENT_KEY = "BUSINESS_MANAGER"
+
     def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Business Manager Agent",
             system_prompt=SYSTEM_PROMPT,
             tools=TOOLS,
             tool_handlers=TOOL_HANDLERS,
-            model=AGENT_MODEL,
             is_guest=is_guest,
         )

@@ -9,7 +9,14 @@ load_dotenv()
 #   reasoning : orchestrator + long-form document agents (planning, scope, financial, business)
 #   fast      : lighter agents (prioritization, orchestration, comms), guest sessions
 #   lite      : cheap structured-output side calls (project-state extraction)
-# Previous-generation fallbacks: gemini-2.5-pro / gemini-2.5-flash / gemini-2.5-flash-lite.
+# Fallbacks if a release misbehaves: gemini-3-flash-preview (fast), gemini-2.5-pro (reasoning).
+# Models are pinned deliberately — the *-latest aliases would swap the model that writes
+# financial workbooks on Google's schedule, untested. Upgrade = change here + rerun the gate.
+#
+# Gemini 3 gotcha (gated 2026-09-21): thinking tokens count against max_output_tokens.
+# If thinking + a tool-call payload overflow the cap, the API reports
+# MALFORMED_FUNCTION_CALL, not MAX_TOKENS. Keep caps at the model ceiling and keep the
+# fast tier on medium thinking — at "high", 3.8-flash spends 20-35k tokens thinking.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL_REASONING = os.getenv("MODEL_REASONING", "gemini-3.1-pro-preview")
 MODEL_FAST = os.getenv("MODEL_FAST", "gemini-3.8-flash")
@@ -54,8 +61,10 @@ PORT = int(os.getenv("PORT", 8000))
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-in-production")
 
 # Trial mode (guest access)
-GUEST_GEMINI_MODEL = os.getenv("GUEST_GEMINI_MODEL", "gemini-2.5-flash")
-GUEST_MAX_OUTPUT_TOKENS = int(os.getenv("GUEST_MAX_OUTPUT_TOKENS", 16000))
+GUEST_GEMINI_MODEL = os.getenv("GUEST_GEMINI_MODEL") or MODEL_FAST
+# Guest cost is bounded by TRIAL_MAX_GENERATIONS, not by a token cap: a cap below the
+# model ceiling makes Gemini 3 tool calls fail as MALFORMED (see note above).
+GUEST_MAX_OUTPUT_TOKENS = int(os.getenv("GUEST_MAX_OUTPUT_TOKENS", 65536))
 TRIAL_SESSION_HOURS = int(os.getenv("TRIAL_SESSION_HOURS", 24))
 TRIAL_MAX_GENERATIONS = int(os.getenv("TRIAL_MAX_GENERATIONS", 3))
 TRIAL_DAILY_CAP = int(os.getenv("TRIAL_DAILY_CAP", 40))

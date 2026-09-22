@@ -1,8 +1,6 @@
 from agents.base_agent import BaseAgent
+from agents import tool_specs
 
-AGENT_MODEL = "gemini-2.5-flash"
-from tools.document_generator import create_word_document, create_excel
-from tools.vertex_search import vertex_search
 
 SYSTEM_PROMPT = """You are the Project Orchestration Agent — an expert in team management, role assignment, and internal project organization.
 
@@ -46,67 +44,23 @@ When orchestrating projects:
 Format all outputs with tables, matrices, and structured content for clarity."""
 
 TOOLS = [
-    {
-        "name": "knowledge_search",
-        "description": "Search the knowledge base and uploaded project documents for team structures, org charts, role definitions, RACI templates, staffing plans, and project context relevant to team orchestration.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "num_results": {"type": "integer", "description": "Number of results (max 10)", "default": 5},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "create_word_document",
-        "description": "Create a professional Word document (.docx) for RACI matrices, role descriptions, task assignments, or internal project documentation.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Document title"},
-                "sections": {
-                    "type": "string",
-                    "description": 'JSON string of sections. Each section: {"heading": str, "level": int, "content": str, "bullet_points": [str], "table": {"headers": [str], "rows": [[str]]}}',
-                },
-                "filename": {"type": "string", "description": "Output filename without extension", "default": ""},
-                "include_toc": {"type": "boolean", "description": "Include table of contents", "default": False},
-            },
-            "required": ["title", "sections"],
-        },
-    },
-    {
-        "name": "create_excel",
-        "description": "Create an Excel spreadsheet (.xlsx) for RACI matrices, task assignment trackers, team schedules, and workload distributions.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Workbook title"},
-                "sheets": {
-                    "type": "string",
-                    "description": 'JSON string of sheets. Each sheet: {"name": str, "headers": [str], "rows": [[values]], "column_widths": [int], "formulas": [{"cell": "C10", "formula": "=SUM(C2:C9)"}], "freeze_panes": "A2"}',
-                },
-                "filename": {"type": "string", "description": "Output filename without extension", "default": ""},
-            },
-            "required": ["title", "sheets"],
-        },
-    },
+    tool_specs.knowledge_search('Search the knowledge base and uploaded project documents for team structures, org charts, role definitions, RACI templates, staffing plans, and project context relevant to team orchestration.'),
+    tool_specs.create_word_document('Create a professional Word document (.docx) for RACI matrices, role descriptions, task assignments, or internal project documentation.'),
+    tool_specs.create_excel('Create an Excel spreadsheet (.xlsx) for RACI matrices, task assignment trackers, team schedules, and workload distributions.'),
 ]
 
-TOOL_HANDLERS = {
-    "knowledge_search": lambda query, num_results=5, username=None, **_: vertex_search(query, num_results, username=username),
-    "create_word_document": lambda **kwargs: create_word_document(**kwargs),
-    "create_excel": lambda **kwargs: create_excel(**kwargs),
-}
+TOOL_HANDLERS = tool_specs.standard_handlers([t['name'] for t in TOOLS])
 
 
 class ProjectOrchestrationAgent(BaseAgent):
+    TIER = "fast"
+    AGENT_KEY = "PROJECT_ORCHESTRATION"
+
     def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Project Orchestration Agent",
             system_prompt=SYSTEM_PROMPT,
             tools=TOOLS,
             tool_handlers=TOOL_HANDLERS,
-            model=AGENT_MODEL,
             is_guest=is_guest,
         )
