@@ -124,7 +124,9 @@ html, body { height: 100%; font-family: var(--font); background: var(--bg); colo
   display: flex;
   flex-direction: column;
   padding: 16px 0 0;
-  overflow-y: hidden;   /* panel itself doesn't scroll */
+  /* Normally only the agent list scrolls; the panel scrolls too if the viewport
+     is shorter than the sections' combined minimum height. */
+  overflow-y: auto;
 }
 
 .panel-label {
@@ -141,6 +143,9 @@ html, body { height: 100%; font-family: var(--font); background: var(--bg); colo
   flex: 1;          /* fill available space */
   overflow-y: auto; /* only the list scrolls */
   padding-bottom: 8px;
+  /* The docs and comms sections below are flex-shrink: 0, so without a floor the
+     agent list collapses to a few pixels on a short viewport. */
+  min-height: 190px;
 }
 
 .agent-item {
