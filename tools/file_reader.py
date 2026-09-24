@@ -11,26 +11,28 @@ from pathlib import Path
 from config import OUTPUT_DIR
 
 
-def read_output_file(filename: str) -> str:
+def read_output_file(filename: str, output_dir=None) -> str:
     """
     Read the content of a file that was previously created in the output folder.
 
     Args:
         filename: The filename (with extension) of the file to read.
-                  Only files inside the output directory can be read.
+        output_dir: The caller's own output folder. Scoping reads to it keeps one
+                    user from reading (or being offered) another user's documents.
 
     Returns:
         JSON string with the file content as structured text, or an error message.
     """
+    base = (Path(output_dir) if output_dir else OUTPUT_DIR).resolve()
     safe_name = Path(filename).name
-    filepath = (OUTPUT_DIR / safe_name).resolve()
+    filepath = (base / safe_name).resolve()
 
-    # Security: only allow reading from OUTPUT_DIR
-    if not str(filepath).startswith(str(OUTPUT_DIR.resolve())):
+    # Security: only allow reading from the caller's own output directory
+    if not str(filepath).startswith(str(base)):
         return json.dumps({"error": "Access denied: file is outside the output directory."})
 
     if not filepath.exists():
-        available = [f.name for f in OUTPUT_DIR.iterdir() if f.is_file()]
+        available = [f.name for f in base.iterdir() if f.is_file()] if base.exists() else []
         return json.dumps({
             "error": f"File '{safe_name}' not found in output directory.",
             "available_files": available,

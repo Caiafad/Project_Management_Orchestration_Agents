@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -56,6 +57,22 @@ SLACK_OAUTH_SCOPES = "chat:write,chat:write.public,channels:read,groups:read,im:
 _base = Path(__file__).parent  # directory containing config.py
 OUTPUT_DIR = (_base / os.getenv("OUTPUT_DIR", "output")).resolve()
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def user_output_dir(username: str | None) -> Path:
+    """Per-user output folder. Concurrent users previously shared one directory,
+    so the before/after file scan could attribute one user's file to another and
+    read_output_file could reach across users. Anonymous/CLI use keeps the root."""
+    if not username:
+        return OUTPUT_DIR
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", username)[:80]
+    # "." and ".." survive the character filter but would resolve outside the
+    # folder ("output/.." is the project root), so reject dot-only names.
+    if not safe.strip("."):
+        safe = "user"
+    path = OUTPUT_DIR / safe
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 # Server
 PORT = int(os.getenv("PORT", 8000))

@@ -93,6 +93,22 @@ def _docx_apply_standard_formatting(doc, title: str):
     ftr_para.add_run(" | Confidential").font.size = Pt(8)
 
 
+def _resolve_path(filename: str, title: str, ext: str, output_dir=None):
+    """Build the output path: basename only (no traversal), no doubled extension,
+    auto-named from the title when empty. Returns (path, final_filename)."""
+    target = Path(output_dir) if output_dir else OUTPUT_DIR
+    target.mkdir(parents=True, exist_ok=True)
+
+    name = Path(str(filename or "")).name.strip()
+    if name.lower().endswith(ext):          # agents often pass "Plan.docx" → "Plan.docx.docx"
+        name = name[: -len(ext)]
+    name = "".join(c if c.isalnum() or c in " -_." else "" for c in name).strip(" .")
+    if not name:
+        safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title).strip()
+        name = f"{safe_title or 'Document'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    return target / f"{name}{ext}", f"{name}{ext}"
+
+
 def _parse_structured(value, label: str):
     """Accept a list (structured tool args) or a JSON string (legacy callers).
     Returns (data, error_json_or_None)."""
@@ -130,6 +146,7 @@ def create_word_document(
     sections,
     filename: str = "",
     include_toc: bool = False,   # kept for backwards compat; TOC is auto-omitted
+    output_dir=None,
 ) -> str:
     """
     Create a Word document (.docx) with structured content.
@@ -231,17 +248,13 @@ def create_word_document(
 
                 doc.add_paragraph("")  # spacer after table
 
-    if not filename:
-        safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title)
-        filename = f"{safe_title}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    filepath = OUTPUT_DIR / f"{filename}.docx"
+    filepath, out_name = _resolve_path(filename, title, ".docx", output_dir)
     doc.save(str(filepath))
 
     return json.dumps({
         "status": "created",
         "file_path": str(filepath.resolve()),
-        "filename": f"{filename}.docx",
+        "filename": out_name,
     })
 
 
@@ -249,6 +262,7 @@ def create_powerpoint(
     title: str,
     slides,
     filename: str = "",
+    output_dir=None,
 ) -> str:
     """
     Create a professional PowerPoint presentation (.pptx).
@@ -487,17 +501,13 @@ def create_powerpoint(
 
         _apply_notes(slide, notes)
 
-    if not filename:
-        safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title)
-        filename = f"{safe_title}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    filepath = OUTPUT_DIR / f"{filename}.pptx"
+    filepath, out_name = _resolve_path(filename, title, ".pptx", output_dir)
     prs.save(str(filepath))
 
     return json.dumps({
         "status": "created",
         "file_path": str(filepath.resolve()),
-        "filename": f"{filename}.pptx",
+        "filename": out_name,
     })
 
 
@@ -505,6 +515,7 @@ def create_excel(
     title: str,
     sheets,
     filename: str = "",
+    output_dir=None,
 ) -> str:
     """
     Create an Excel workbook (.xlsx) with structured data, formatting, and optional formulas.
@@ -610,15 +621,11 @@ def create_excel(
         if freeze_panes:
             ws.freeze_panes = freeze_panes
 
-    if not filename:
-        safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title)
-        filename = f"{safe_title}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    filepath = OUTPUT_DIR / f"{filename}.xlsx"
+    filepath, out_name = _resolve_path(filename, title, ".xlsx", output_dir)
     wb.save(str(filepath))
 
     return json.dumps({
         "status": "created",
         "file_path": str(filepath.resolve()),
-        "filename": f"{filename}.xlsx",
+        "filename": out_name,
     })

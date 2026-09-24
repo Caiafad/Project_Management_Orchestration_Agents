@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from google import genai
 from google.genai import types
-from config import GEMINI_API_KEY, GEMINI_MODEL, GUEST_GEMINI_MODEL
+from config import GEMINI_API_KEY, GEMINI_MODEL, GUEST_GEMINI_MODEL, user_output_dir
+from agents.tool_specs import standard_handlers
 from agents.base_agent import (
     convert_tools_to_gemini, _generate_with_retry, make_thinking_config,
     DEFAULT_MAX_OUTPUT_TOKENS, AgentResult,
@@ -100,7 +101,7 @@ _DOC_TOOLS = {
 
 def _wrap_tool_handlers(tool_handlers: dict, emit: Callable, username: str = None,
                         files_out: list | None = None, doc_spec: dict | None = None,
-                        revisions: dict | None = None) -> dict:
+                        revisions: dict | None = None, output_dir=None) -> dict:
     """Wrap a sub-agent's tool handlers to emit UI events, validate and upload output
     files, and record every file created into `files_out` (the agent's files_created
     list) so the orchestrator gets an exact list back.
@@ -177,9 +178,11 @@ def _wrap_tool_handlers(tool_handlers: dict, emit: Callable, username: str = Non
                     emit({"type": "tool_call", "tool": "python",
                           "description": "Running Python calculations..."})
                     from config import OUTPUT_DIR
+                    watched = Path(output_dir) if output_dir else OUTPUT_DIR
                     # Snapshot (name, mtime) so an overwritten file still counts as produced.
                     def snap():
-                        return {p: p.stat().st_mtime_ns for p in OUTPUT_DIR.glob("*")} if OUTPUT_DIR.exists() else {}
+                        return {p: p.stat().st_mtime_ns for p in watched.glob("*")
+                                if p.is_file()} if watched.exists() else {}
                     before = snap()
                     with Timer() as t:
                         result = h(code, **kw)
@@ -295,8 +298,21 @@ def _create_event_agent(tool_name: str, emit: Callable, username: str = None, is
         agent = cls(username=username, is_guest=is_guest)
     else:
         agent = cls(is_guest=is_guest)
+
+    # Rebind the file tools to this user's own output folder. The agent modules
+    # build TOOL_HANDLERS once at import, so without this every concurrent user
+    # would read and write the same directory.
+    output_dir = user_output_dir(username)
+    file_tools = [t["name"] for t in agent.tools
+                  if t["name"] in {"execute_python", "read_output_file",
+                                   "create_word_document", "create_excel", "create_powerpoint"}]
+    if file_tools:
+        agent.tool_handlers = {**agent.tool_handlers,
+                               **standard_handlers(file_tools, output_dir=output_dir)}
+
     agent.tool_handlers = _wrap_tool_handlers(
         agent.tool_handlers, emit, username, agent.files_created, agent.DOC_SPEC,
+        output_dir=output_dir,
     )
     return agent
 

@@ -138,9 +138,13 @@ def create_powerpoint(description: str = "Create a professional PowerPoint prese
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
 
-def standard_handlers(tool_names: list[str]) -> dict:
+def standard_handlers(tool_names: list[str], output_dir=None) -> dict:
     """Default handler map for the given tool names. Import lazily so agents that
-    don't use a tool never import its dependencies."""
+    don't use a tool never import its dependencies.
+
+    `output_dir` binds every file tool to one user's folder. It must be bound per
+    agent instance, never at import time — these handlers would otherwise be shared
+    by all concurrent users."""
     from tools.vertex_search import vertex_search
     from tools.python_executor import execute_python as _exec
     from tools.file_reader import read_output_file as _read
@@ -148,10 +152,11 @@ def standard_handlers(tool_names: list[str]) -> dict:
 
     catalogue = {
         "knowledge_search": lambda query, num_results=5, username=None, **_: vertex_search(query, num_results, username=username),
-        "execute_python": lambda code, **_: _exec(code),
-        "read_output_file": lambda filename, **_: _read(filename),
-        "create_word_document": lambda **kw: dg.create_word_document(**kw),
-        "create_excel": lambda **kw: dg.create_excel(**kw),
-        "create_powerpoint": lambda **kw: dg.create_powerpoint(**kw),
+        "execute_python": lambda code, **_: _exec(code, output_dir=output_dir),
+        "read_output_file": lambda filename, **_: _read(filename, output_dir=output_dir),
+        # Drop any output_dir the model hallucinates into the args; it is ours to set.
+        "create_word_document": lambda **kw: dg.create_word_document(**{**kw, "output_dir": output_dir}),
+        "create_excel": lambda **kw: dg.create_excel(**{**kw, "output_dir": output_dir}),
+        "create_powerpoint": lambda **kw: dg.create_powerpoint(**{**kw, "output_dir": output_dir}),
     }
     return {n: catalogue[n] for n in tool_names}

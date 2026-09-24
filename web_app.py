@@ -11,6 +11,7 @@ import sys
 import os
 import re
 import json
+import logging
 import queue
 import hmac
 import threading
@@ -25,7 +26,7 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 import uvicorn
 
 from config import (
-    OUTPUT_DIR, PORT, TRIAL_SESSION_HOURS, TRIAL_MAX_GENERATIONS, PURGE_SECRET,
+    OUTPUT_DIR, user_output_dir, PORT, TRIAL_SESSION_HOURS, TRIAL_MAX_GENERATIONS, PURGE_SECRET,
     SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_REDIRECT_URI, SLACK_OAUTH_SCOPES,
 )
 from auth import (
@@ -33,6 +34,11 @@ from auth import (
     make_session_cookie, clear_session_cookie, is_guest,
 )
 from event_orchestrator import EventOrchestrator
+from logging_setup import configure as configure_logging, bind as bind_log_context
+
+# Configure before anything else logs, so uvicorn's handlers are replaced too.
+configure_logging()
+log = logging.getLogger(__name__)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -103,9 +109,12 @@ async def trial_start(email: str = Form(...)):
             return RedirectResponse("/trial?full=1", status_code=303)
         guest_id = create_guest(email)
     except Exception as e:
-        print(f"[trial] failed to create guest session: {e}", flush=True)
+        log.exception("could not create trial session",
+                      extra={"event": "trial_signup_failed", "lead_email": email})
         return RedirectResponse("/trial?error=unavailable", status_code=303)
 
+    log.info("trial session created",
+             extra={"event": "trial_signup", "guest": guest_id, "lead_email": email})
     append_lead(email, guest_id)
 
     response = RedirectResponse("/", status_code=303)
@@ -145,7 +154,8 @@ async def purge_guests(request: Request):
         try:
             summary["files_deleted"] += delete_all_files(guest_id)
         except Exception as e:
-            print(f"[purge] warning: could not delete GCS files for {guest_id}: {e}", flush=True)
+            log.warning("could not delete GCS files for %s: %s", guest_id, e,
+                        extra={"event": "purge_files_failed", "guest": guest_id})
         ws = delete_user_workspace(guest_id)
         summary["uploads_deleted"] += ws["uploads_deleted"]
         summary["datastores_deleted"] += int(ws["datastore_deleted"])
@@ -321,10 +331,11 @@ async def list_files(username: str = Depends(require_auth)):
         from tools.gcs_output import list_files as _gcs_list
         return _gcs_list(username)
     except Exception:
-        # Fallback to local OUTPUT_DIR during local dev or if GCS is unavailable
+        # Fallback to this user's local folder during local dev or if GCS is unavailable
         files = []
-        if OUTPUT_DIR.exists():
-            for f in sorted(OUTPUT_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        user_dir = user_output_dir(username)
+        if user_dir.exists():
+            for f in sorted(user_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
                 if f.is_file() and f.suffix in ICON_MAP:
                     files.append({
                         "filename": f.name,
@@ -343,8 +354,9 @@ async def clear_files(username: str = Depends(require_auth)):
         count = _gcs_delete(username)
     except Exception:
         count = 0
-        if OUTPUT_DIR.exists():
-            for f in OUTPUT_DIR.iterdir():
+        user_dir = user_output_dir(username)
+        if user_dir.exists():
+            for f in user_dir.iterdir():
                 if f.is_file() and f.suffix in ICON_MAP:
                     f.unlink(missing_ok=True)
                     count += 1
@@ -361,8 +373,9 @@ async def delete_one_file(filename: str, username: str = Depends(require_auth)):
         from tools.gcs_output import delete_file as _gcs_del
         _gcs_del(username, safe_name)
     except Exception:
-        local = (OUTPUT_DIR / safe_name).resolve()
-        if str(local).startswith(str(OUTPUT_DIR.resolve())) and local.exists():
+        user_dir = user_output_dir(username).resolve()
+        local = (user_dir / safe_name).resolve()
+        if str(local).startswith(str(user_dir)) and local.exists():
             local.unlink(missing_ok=True)
     return {"deleted": safe_name}
 
@@ -445,9 +458,10 @@ async def download_file(filename: str, username: str = Depends(require_auth)):
     except Exception:
         pass
 
-    # Fallback: local filesystem (local dev)
-    filepath = (OUTPUT_DIR / safe_name).resolve()
-    if not str(filepath).startswith(str(OUTPUT_DIR.resolve())):
+    # Fallback: local filesystem (local dev), scoped to this user's folder
+    user_dir = user_output_dir(username).resolve()
+    filepath = (user_dir / safe_name).resolve()
+    if not str(filepath).startswith(str(user_dir)):
         raise HTTPException(status_code=400, detail="Invalid filename")
     if not filepath.exists() or not filepath.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -537,9 +551,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     verdict = await loop.run_in_executor(None, check_and_increment, username)
                 except Exception as e:
-                    print(f"[trial] quota check failed for {username}: {e}", flush=True)
+                    # Fail closed: a broken quota store must not become an open endpoint.
+                    log.exception("quota check failed — denying to fail closed",
+                                  extra={"event": "quota_check_error", "guest": username})
                     verdict = {"ok": False, "reason": "daily_cap"}
                 if not verdict["ok"]:
+                    log.info("trial quota exhausted",
+                             extra={"event": "quota_blocked", "guest": username,
+                                    "reason": verdict["reason"]})
                     await websocket.send_text(json.dumps({
                         "type": "quota_exceeded",
                         "reason": verdict["reason"],

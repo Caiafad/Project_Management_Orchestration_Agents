@@ -6,16 +6,19 @@ import tempfile
 from pathlib import Path
 
 
-def execute_python(code: str, timeout: int = 120) -> str:
-    """Execute Python code in a sandboxed subprocess and return the output.
+def execute_python(code: str, timeout: int = 120, output_dir=None) -> str:
+    """Execute Python code in a subprocess and return the output.
 
     The variable OUTPUT_DIR (a pathlib.Path) is automatically injected into
     every script so agents can save files directly to the output folder.
+    `output_dir` scopes that to the calling user's own folder.
     """
     # Dynamically resolve OUTPUT_DIR so it is always correct regardless of cwd
     from config import OUTPUT_DIR
 
-    abs_output_dir = str(OUTPUT_DIR.resolve())
+    target = Path(output_dir) if output_dir else OUTPUT_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    abs_output_dir = str(target.resolve())
 
     # Standard Excel formatting helpers — always available in every script.
     # Mirrors the styling used by create_excel: blue headers, alternating rows,
