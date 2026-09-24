@@ -475,6 +475,8 @@ async def websocket_endpoint(websocket: WebSocket):
     event_queue = queue.Queue()
 
     guest = is_guest(username)
+    bind_log_context(user=username)
+    log.info("websocket connected", extra={"event": "ws_connected", "is_guest": guest})
     orchestrator = EventOrchestrator(
         event_callback=lambda e: event_queue.put(e), username=username, is_guest=guest,
     )
@@ -565,12 +567,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     pass
 
     except WebSocketDisconnect:
-        pass
+        log.info("websocket disconnected", extra={"event": "ws_disconnected"})
     except Exception as e:
+        log.exception("websocket handler failed", extra={"event": "ws_error"})
         try:
             await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
         except Exception:
-            pass
+            log.debug("could not deliver error to a closed socket")
 
 
 # ── Static files (last — so routes above take priority) ──────────────────────
@@ -578,8 +581,6 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 if __name__ == "__main__":
-    print("\n" + "=" * 55)
-    print("  Project Management Agent — Web Interface")
-    print(f"  Open your browser at: http://localhost:{PORT}")
-    print("=" * 55 + "\n")
+    log.info("starting web interface at http://localhost:%s", PORT,
+             extra={"event": "server_start", "port": PORT})
     uvicorn.run(app, host="0.0.0.0", port=PORT, reload=False)

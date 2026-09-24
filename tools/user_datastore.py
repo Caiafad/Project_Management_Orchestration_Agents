@@ -13,11 +13,14 @@ Workflow:
   5. vertex_search() optionally queries the user's datastore alongside the global ones
 """
 
+import logging
 import re
 from pathlib import Path
 from google.cloud import discoveryengine_v1 as discoveryengine
 from google.api_core.exceptions import AlreadyExists, NotFound
 from config import GCP_PROJECT_ID, VERTEX_LOCATION
+
+log = logging.getLogger(__name__)
 
 UPLOAD_BUCKET = "pm-agent-knowledge-docs"
 UPLOAD_PREFIX = "user-uploads"
@@ -239,7 +242,8 @@ def delete_user_workspace(username: str) -> dict:
             blob.delete()
             uploads_deleted += 1
     except Exception as e:
-        print(f"[user_datastore] warning: could not delete uploads for {username}: {e}", flush=True)
+        log.warning("could not delete uploads for %s: %s", username, e,
+                    extra={"event": "purge_uploads_failed", "purged_user": username})
 
     datastore_deleted = False
     try:
@@ -249,7 +253,8 @@ def delete_user_workspace(username: str) -> dict:
     except NotFound:
         pass
     except Exception as e:
-        print(f"[user_datastore] warning: could not delete datastore for {username}: {e}", flush=True)
+        log.warning("could not delete datastore for %s: %s", username, e,
+                    extra={"event": "purge_datastore_failed", "purged_user": username})
 
     return {"uploads_deleted": uploads_deleted, "datastore_deleted": datastore_deleted}
 

@@ -11,12 +11,15 @@ Failures here must never block a trial signup, so every entry point catches
 and logs rather than raises.
 """
 
+import logging
 from datetime import datetime, timezone
 
 import google.auth
 from googleapiclient.discovery import build
 
 from config import TRIAL_LEADS_SHEET_ID
+
+log = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SHEET_RANGE = "Sheet1!A:C"
@@ -30,7 +33,8 @@ def _sheets_service():
 def append_lead(email: str, guest_id: str) -> None:
     """Append [email, timestamp, guest_id] to the leads sheet. Best-effort."""
     if not TRIAL_LEADS_SHEET_ID:
-        print("[leads_sheet] TRIAL_LEADS_SHEET_ID not configured — skipping lead capture", flush=True)
+        log.warning("TRIAL_LEADS_SHEET_ID not configured — lead not captured",
+                    extra={"event": "lead_skipped", "lead_email": email})
         return
     try:
         service = _sheets_service()
@@ -43,4 +47,5 @@ def append_lead(email: str, guest_id: str) -> None:
             body={"values": row},
         ).execute()
     except Exception as e:
-        print(f"[leads_sheet] warning: failed to append lead: {e}", flush=True)
+        log.warning("failed to append lead to sheet: %s", e,
+                    extra={"event": "lead_append_failed", "lead_email": email, "guest": guest_id})

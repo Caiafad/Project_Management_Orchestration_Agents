@@ -1,3 +1,4 @@
+import logging
 import subprocess
 import sys
 import json
@@ -23,6 +24,8 @@ def execute_python(code: str, timeout: int = 120) -> str:
     excel_helpers = '''
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter as _gcl
+
+log = logging.getLogger(__name__)
 
 _HEADER_FONT   = Font(bold=True, color="FFFFFF", size=11)
 _HEADER_FILL   = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
@@ -946,12 +949,10 @@ def pptx_add_table_slide(prs, title, headers, rows, col_widths=None, notes=""):
     finally:
         Path(temp_path).unlink(missing_ok=True)
 
-    # Log result so Cloud Run logs show what's happening
-    import sys as _sys
-    print(f"[execute_python] exit_code={output['exit_code']}", flush=True)
-    if output["stderr"]:
-        print(f"[execute_python] stderr: {output['stderr'][:500]}", flush=True)
+    # The event wrapper logs exit code, duration and stderr; keep stdout here since
+    # agent scripts print their own progress ("Saved Financial_Plan.xlsx").
     if output["stdout"]:
-        print(f"[execute_python] stdout: {output['stdout'][:200]}", flush=True)
+        log.info("script stdout", extra={"event": "python_stdout",
+                                         "stdout": output["stdout"][:1000]})
 
     return json.dumps(output, indent=2)

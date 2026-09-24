@@ -25,6 +25,8 @@ from config import (
     GEMINI_API_KEY, GEMINI_MODEL, GUEST_GEMINI_MODEL, GUEST_MAX_OUTPUT_TOKENS, model_for,
 )
 
+from logging_setup import Timer
+
 log = logging.getLogger(__name__)
 
 GEMINI_TIMEOUT = 240          # seconds per API call before treating it as hung
@@ -250,20 +252,36 @@ class BaseAgent:
 
             active_cfg = override_cfg or (first_cfg if turn == 1 else work_cfg)
             override_cfg = None
-            log.info("[%s] turn %d model=%s", self.name, turn, self.model)
 
             try:
-                response = _generate_with_retry(self.client, self.model, contents, active_cfg)
+                with Timer() as t:
+                    response = _generate_with_retry(self.client, self.model, contents, active_cfg)
             except Exception as e:
-                log.exception("[%s] Gemini call failed", self.name)
+                log.exception("Gemini call failed", extra={"event": "agent_model_error",
+                                                           "turn": turn, "model": self.model})
                 return self._fail(f"model call failed: {e}", file_generated)
 
             candidate = response.candidates[0]
             finish_reason = str(getattr(candidate, "finish_reason", ""))
+            usage = getattr(response, "usage_metadata", None)
+            log.info("turn %d", turn,
+                     extra={"event": "agent_turn", "turn": turn, "model": self.model,
+                            "duration_ms": t.ms, "finish_reason": finish_reason,
+                            "prompt_tokens": getattr(usage, "prompt_token_count", None),
+                            "thinking_tokens": getattr(usage, "thoughts_token_count", None),
+                            "output_tokens": getattr(usage, "candidates_token_count", None),
+                            "max_output_tokens": self.max_output_tokens})
 
             if "MALFORMED_FUNCTION_CALL" in finish_reason:
                 malformed_retries += 1
-                log.warning("[%s] MALFORMED_FUNCTION_CALL (%d)", self.name, malformed_retries)
+                # On Gemini 3 this nearly always means the call overflowed the output
+                # budget: compare thinking+output against max_output_tokens above.
+                log.warning("malformed tool call — likely truncated",
+                            extra={"event": "agent_malformed", "attempt": malformed_retries,
+                                   "turn": turn,
+                                   "thinking_tokens": getattr(usage, "thoughts_token_count", None),
+                                   "output_tokens": getattr(usage, "candidates_token_count", None),
+                                   "max_output_tokens": self.max_output_tokens})
                 if malformed_retries > MAX_MALFORMED_RETRIES:
                     return self._fail("repeated malformed tool calls", file_generated)
                 retry_allowed = file_tools if file_tools and not file_generated else None
@@ -274,7 +292,11 @@ class BaseAgent:
 
             if "MAX_TOKENS" in finish_reason:
                 continuations += 1
-                log.warning("[%s] MAX_TOKENS hit (%d)", self.name, continuations)
+                log.warning("output limit reached — continuing",
+                            extra={"event": "agent_max_tokens", "attempt": continuations, "turn": turn,
+                                   "thinking_tokens": getattr(usage, "thoughts_token_count", None),
+                                   "output_tokens": getattr(usage, "candidates_token_count", None),
+                                   "max_output_tokens": self.max_output_tokens})
                 if continuations > MAX_CONTINUATIONS:
                     return self._fail("output repeatedly exceeded the token limit", file_generated)
                 if candidate.content and candidate.content.parts:
@@ -313,19 +335,23 @@ class BaseAgent:
             for part in function_calls:
                 fc = part.function_call
                 handler = self.tool_handlers.get(fc.name)
-                log.info("[%s] tool call: %s", self.name, fc.name)
+                log.info("tool call: %s", fc.name,
+                         extra={"event": "agent_tool_call", "tool": fc.name, "turn": turn})
                 if handler:
                     try:
                         result = handler(**dict(fc.args))
                     except Exception as e:
-                        log.exception("[%s] tool %s raised", self.name, fc.name)
+                        log.exception("tool %s raised", fc.name,
+                                      extra={"event": "agent_tool_error", "tool": fc.name})
                         result = json.dumps({"error": f"{type(e).__name__}: {e}"})
                 else:
                     result = json.dumps({"error": f"No handler registered for tool '{fc.name}'"})
                 result_str = str(result)
                 if fc.name in FILE_GEN_TOOLS and tool_result_ok(fc.name, result_str):
                     file_generated = True
-                log.info("[%s] tool result (%s): %.150s", self.name, fc.name, result_str)
+                log.debug("tool result", extra={"event": "agent_tool_result", "tool": fc.name,
+                                                "ok": fc.name not in FILE_GEN_TOOLS or tool_result_ok(fc.name, result_str),
+                                                "result": result_str[:500]})
                 response_parts.append(types.Part.from_function_response(
                     name=fc.name, response={"result": result_str},
                 ))
@@ -334,7 +360,10 @@ class BaseAgent:
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _fail(self, reason: str, file_generated: bool, text: str = "") -> AgentResult:
-        log.error("[%s] failed: %s", self.name, reason)
+        log.error("agent failed: %s", reason,
+                  extra={"event": "agent_failed", "reason": reason,
+                         "files": ",".join(self.files_created),
+                         "any_file_produced": file_generated})
         # A partial run may still have produced usable files — report them honestly.
         return AgentResult(text=text, files=list(self.files_created), status="failed", error=reason)
 

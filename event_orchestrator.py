@@ -9,6 +9,8 @@ creation, chain of thought, and final responses.
 import sys
 import os
 import json
+import logging
+from pathlib import Path
 from typing import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -17,9 +19,22 @@ from google import genai
 from google.genai import types
 from config import GEMINI_API_KEY, GEMINI_MODEL, GUEST_GEMINI_MODEL
 from agents.base_agent import (
-    convert_tools_to_gemini, _generate_with_retry, make_thinking_config, DEFAULT_MAX_OUTPUT_TOKENS,
+    convert_tools_to_gemini, _generate_with_retry, make_thinking_config,
+    DEFAULT_MAX_OUTPUT_TOKENS, AgentResult,
 )
 from orchestrator import ORCHESTRATOR_SYSTEM_PROMPT, ORCHESTRATOR_TOOLS
+from project_state import ProjectState, extract_delta
+from logging_setup import Timer, bind, context as log_context, new_run_id
+
+log = logging.getLogger(__name__)
+
+MAX_ORCHESTRATOR_TURNS = 12
+# Agents whose summaries carry project facts worth folding into the shared state.
+STATE_CONTRIBUTORS = {
+    "delegate_to_project_planning", "delegate_to_scope_definition",
+    "delegate_to_project_orchestration", "delegate_to_financial_manager",
+    "delegate_to_business_manager", "delegate_to_prioritization",
+}
 
 # Metadata for each agent — used by the frontend for display
 AGENT_META = {
@@ -74,19 +89,40 @@ AGENT_META = {
 }
 
 
-def _wrap_tool_handlers(tool_handlers: dict, emit: Callable, username: str = None) -> dict:
-    """Wrap a sub-agent's tool handlers to emit events and upload output files to GCS."""
+_EXT_TO_DOC_TYPE = {".xlsx": "excel", ".docx": "word", ".pptx": "powerpoint"}
+_DOC_TOOLS = {
+    "create_word_document": ("word", "Creating Word document"),
+    "create_excel": ("excel", "Creating Excel spreadsheet"),
+    "create_powerpoint": ("powerpoint", "Creating PowerPoint"),
+}
+
+
+def _wrap_tool_handlers(tool_handlers: dict, emit: Callable, username: str = None,
+                        files_out: list | None = None) -> dict:
+    """Wrap a sub-agent's tool handlers to emit UI events, upload output files to
+    GCS, and record every file created into `files_out` (the agent's
+    files_created list) so the orchestrator gets an exact list back."""
     wrapped = {}
+    files_out = files_out if files_out is not None else []
 
     def _gcs_upload(local_path):
-        """Upload a file to GCS under the user's prefix (best-effort)."""
         if not username:
             return
         try:
             from tools.gcs_output import upload_file as _upload
             _upload(username, local_path)
         except Exception as e:
-            print(f"[gcs_upload] warning: {e}", flush=True)
+            log.warning("GCS upload failed for %s: %s", local_path, e)
+
+    def _record(path, doc_type):
+        path = Path(path)
+        size = path.stat().st_size if path.exists() else 0
+        _gcs_upload(path)
+        files_out.append(path.name)
+        log.info("file produced", extra={"event": "file_created", "filename": path.name,
+                                        "doc_type": doc_type, "bytes": size})
+        emit({"type": "document_created", "doc_type": doc_type,
+              "filename": path.name, "path": str(path)})
 
     for name, handler in tool_handlers.items():
 
@@ -96,16 +132,35 @@ def _wrap_tool_handlers(tool_handlers: dict, emit: Callable, username: str = Non
                     emit({"type": "tool_call", "tool": "python",
                           "description": "Running Python calculations..."})
                     from config import OUTPUT_DIR
-                    _ext_map = {".xlsx": "excel", ".docx": "word", ".pptx": "powerpoint"}
-                    before = set(OUTPUT_DIR.glob("*")) if OUTPUT_DIR.exists() else set()
-                    result = h(code, **kw)
-                    after = set(OUTPUT_DIR.glob("*")) if OUTPUT_DIR.exists() else set()
-                    for fpath in sorted(after - before):
-                        doc_type = _ext_map.get(fpath.suffix.lower())
+                    # Snapshot (name, mtime) so an overwritten file still counts as produced.
+                    def snap():
+                        return {p: p.stat().st_mtime_ns for p in OUTPUT_DIR.glob("*")} if OUTPUT_DIR.exists() else {}
+                    before = snap()
+                    with Timer() as t:
+                        result = h(code, **kw)
+                    after = snap()
+                    produced = sorted(p for p, m in after.items() if before.get(p) != m)
+                    exit_code, stderr_tail = None, ""
+                    try:
+                        parsed = json.loads(result)
+                        exit_code = parsed.get("exit_code")
+                        stderr_tail = (parsed.get("stderr") or "")[-600:]
+                    except (TypeError, ValueError):
+                        pass
+                    level = logging.INFO if exit_code == 0 else logging.ERROR
+                    log.log(level, "execute_python finished",
+                            extra={"event": "tool_finished", "tool": "execute_python",
+                                   "exit_code": exit_code, "duration_ms": t.ms,
+                                   "code_chars": len(code or ""), "files_touched": len(produced)})
+                    if exit_code not in (0, None) and stderr_tail:
+                        # The traceback is the single most useful thing when a doc goes missing.
+                        log.error("execute_python stderr", extra={"event": "tool_stderr",
+                                                                  "tool": "execute_python",
+                                                                  "stderr": stderr_tail})
+                    for fpath in produced:
+                        doc_type = _EXT_TO_DOC_TYPE.get(fpath.suffix.lower())
                         if doc_type:
-                            _gcs_upload(fpath)
-                            emit({"type": "document_created", "doc_type": doc_type,
-                                  "filename": fpath.name, "path": str(fpath)})
+                            _record(fpath, doc_type)
                     return result
                 return fn
             wrapped[name] = make_python(handler)
@@ -115,66 +170,42 @@ def _wrap_tool_handlers(tool_handlers: dict, emit: Callable, username: str = Non
                 def fn(query, num_results=5, **kw):
                     emit({"type": "tool_call", "tool": "search",
                           "description": f'Searching knowledge base: "{query[:55]}"'})
-                    return h(query, num_results, username=_username, **kw)
+                    with Timer() as t:
+                        result = h(query, num_results, username=_username, **kw)
+                    log.info("knowledge_search finished",
+                             extra={"event": "tool_finished", "tool": "knowledge_search",
+                                    "query": (query or "")[:120], "duration_ms": t.ms,
+                                    "result_chars": len(str(result))})
+                    return result
                 return fn
             wrapped[name] = make_search(handler)
 
-        elif name == "create_word_document":
-            def make_word(h):
+        elif name in _DOC_TOOLS:
+            def make_doc(h, doc_type, label, tool_name):
                 def fn(title="", **kw):
-                    emit({"type": "tool_call", "tool": "word",
-                          "description": f"Creating Word document: {title}"})
-                    result = h(title=title, **kw)
+                    emit({"type": "tool_call", "tool": doc_type, "description": f"{label}: {title}"})
+                    with Timer() as t:
+                        result = h(title=title, **kw)
                     try:
                         d = json.loads(result)
-                        if d.get("status") == "created":
-                            from pathlib import Path as _P
-                            _gcs_upload(_P(d["file_path"]))
-                            emit({"type": "document_created", "doc_type": "word",
-                                  "filename": d["filename"], "path": d["file_path"]})
-                    except Exception:
-                        pass
+                    except (TypeError, ValueError):
+                        log.error("%s returned non-JSON output", tool_name,
+                                  extra={"event": "tool_failed", "tool": tool_name,
+                                         "duration_ms": t.ms, "raw": str(result)[:400]})
+                        return result
+                    if d.get("status") == "created":
+                        log.info("%s created a document", tool_name,
+                                 extra={"event": "tool_finished", "tool": tool_name,
+                                        "title": str(title)[:120], "duration_ms": t.ms})
+                        _record(d["file_path"], doc_type)
+                    else:
+                        log.error("%s did not create a file", tool_name,
+                                  extra={"event": "tool_failed", "tool": tool_name,
+                                         "title": str(title)[:120], "duration_ms": t.ms,
+                                         "error": str(d.get("error", d))[:400]})
                     return result
                 return fn
-            wrapped[name] = make_word(handler)
-
-        elif name == "create_excel":
-            def make_excel(h):
-                def fn(title="", **kw):
-                    emit({"type": "tool_call", "tool": "excel",
-                          "description": f"Creating Excel spreadsheet: {title}"})
-                    result = h(title=title, **kw)
-                    try:
-                        d = json.loads(result)
-                        if d.get("status") == "created":
-                            from pathlib import Path as _P
-                            _gcs_upload(_P(d["file_path"]))
-                            emit({"type": "document_created", "doc_type": "excel",
-                                  "filename": d["filename"], "path": d["file_path"]})
-                    except Exception:
-                        pass
-                    return result
-                return fn
-            wrapped[name] = make_excel(handler)
-
-        elif name == "create_powerpoint":
-            def make_pptx(h):
-                def fn(title="", **kw):
-                    emit({"type": "tool_call", "tool": "powerpoint",
-                          "description": f"Creating PowerPoint: {title}"})
-                    result = h(title=title, **kw)
-                    try:
-                        d = json.loads(result)
-                        if d.get("status") == "created":
-                            from pathlib import Path as _P
-                            _gcs_upload(_P(d["file_path"]))
-                            emit({"type": "document_created", "doc_type": "powerpoint",
-                                  "filename": d["filename"], "path": d["file_path"]})
-                    except Exception:
-                        pass
-                    return result
-                return fn
-            wrapped[name] = make_pptx(handler)
+            wrapped[name] = make_doc(handler, *_DOC_TOOLS[name], name)
 
         else:
             wrapped[name] = handler
@@ -212,7 +243,7 @@ def _create_event_agent(tool_name: str, emit: Callable, username: str = None, is
         agent = cls(username=username, is_guest=is_guest)
     else:
         agent = cls(is_guest=is_guest)
-    agent.tool_handlers = _wrap_tool_handlers(agent.tool_handlers, emit, username)
+    agent.tool_handlers = _wrap_tool_handlers(agent.tool_handlers, emit, username, agent.files_created)
     return agent
 
 
@@ -226,6 +257,7 @@ class EventOrchestrator:
         self.model = GUEST_GEMINI_MODEL if is_guest else GEMINI_MODEL
         self.client = genai.Client(api_key=GEMINI_API_KEY)
         self.conversation_history = []
+        self.state = ProjectState()      # shared source of truth across delegations
         self.tools = ORCHESTRATOR_TOOLS
         self.gemini_tools = [types.Tool(
             function_declarations=convert_tools_to_gemini(self.tools)
@@ -240,28 +272,81 @@ class EventOrchestrator:
     def _delegate_handler(self, tool_name: str):
         meta = AGENT_META.get(tool_name, {})
 
-        def handler(task: str = "", context: str = "", **_):
+        def handler(task: str = "", ctx: str = "", context: str = "", **_) -> AgentResult:
+            agent_label = meta.get("name", tool_name)
             self.emit({
                 "type": "agent_activated",
                 "tool_name": tool_name,
-                "agent": meta.get("name", tool_name),
+                "agent": agent_label,
                 "icon": meta.get("icon", "robot"),
                 "color": meta.get("color", "#ffffff"),
                 "description": meta.get("description", ""),
                 "task": task[:120],
             })
-            try:
-                agent = _create_event_agent(tool_name, self.emit, self.username, self.is_guest)
-                result = agent.run(task, context)
-            except Exception as e:
-                result = f"Error: {str(e)}"
-            self.emit({"type": "agent_done", "tool_name": tool_name,
-                       "agent": meta.get("name", tool_name)})
+            supplied = context or ctx
+            # The accumulated brief is injected here, in code, so every downstream
+            # agent works from the same facts no matter what the router model typed.
+            brief_injected = self.state.has_brief() or bool(self.state.files)
+            full_context = f"{self.state.to_brief()}\n\n{supplied}".rstrip() if brief_injected else supplied
+
+            with log_context(agent=agent_label):
+                log.info("delegating to %s", agent_label,
+                         extra={"event": "agent_started", "tool_name": tool_name,
+                                "task": task[:200], "brief_injected": brief_injected,
+                                "context_chars": len(full_context),
+                                "known_files": len(self.state.files)})
+                try:
+                    with Timer() as t:
+                        agent = _create_event_agent(tool_name, self.emit, self.username, self.is_guest)
+                        result = agent.run(task, full_context)
+                except Exception as e:
+                    log.exception("delegation raised", extra={"event": "agent_crashed",
+                                                              "tool_name": tool_name})
+                    result = AgentResult(text="", status="failed", error=f"{type(e).__name__}: {e}")
+                    t = None
+                log.log(logging.INFO if result.status == "success" else logging.ERROR,
+                        "%s finished (%s)", agent_label, result.status,
+                        extra={"event": "agent_finished", "tool_name": tool_name,
+                               "status": result.status, "error": result.error or "",
+                               "files": ",".join(result.files), "file_count": len(result.files),
+                               "duration_ms": getattr(t, "ms", None),
+                               "response_chars": len(result.text or "")})
+                self.emit({"type": "agent_done", "tool_name": tool_name, "agent": agent_label})
+                self._absorb(tool_name, result)
             return result
 
         return handler
 
+    def _absorb(self, tool_name: str, result: AgentResult) -> None:
+        """Fold a finished agent's files and stated facts into the shared state."""
+        agent_name = AGENT_META.get(tool_name, {}).get("name", tool_name) + " Agent"
+        if result.files:
+            self.state.add_files(result.files, agent_name)
+        if result.status != "success" or tool_name not in STATE_CONTRIBUTORS:
+            return
+        self.emit({"type": "thinking", "text": "Recording project facts for downstream agents..."})
+        with Timer() as t:
+            delta = extract_delta(agent_name, result.text, self.client)
+            changed = self.state.merge(delta, agent_name)
+        log.info("project state merged from %s", agent_name,
+                 extra={"event": "state_merged", "changed": ",".join(changed) or "none",
+                        "extracted_fields": ",".join(k for k, v in delta.items() if v) or "none",
+                        "duration_ms": t.ms, "state_files": len(self.state.files)})
+        if not delta:
+            log.warning("no project facts extracted — downstream agents may lack context",
+                        extra={"event": "state_extraction_empty", "agent_name": agent_name,
+                               "response_chars": len(result.text or "")})
+
     def run(self, user_input: str) -> str:
+        # web_app runs this on a worker thread, where contextvars start empty —
+        # rebind so every log line from this run carries the same run_id.
+        run_id = new_run_id()
+        bind(user=self.username or "anonymous", run_id=run_id, agent="")
+        log.info("run started", extra={"event": "run_started", "model": self.model,
+                                       "is_guest": self.is_guest,
+                                       "prompt": user_input[:300],
+                                       "prompt_chars": len(user_input),
+                                       "history_turns": len(self.conversation_history)})
         self.emit({"type": "thinking", "text": "Analyzing your request..."})
 
         self.conversation_history.append(
@@ -286,16 +371,38 @@ class EventOrchestrator:
 
         is_first_call = True
         active_config = forced_tool_config   # first call must call a tool
+        turns = 0
+        any_agent_succeeded = False          # across the whole run, not just this turn
 
         while True:
+            turns += 1
+            if turns > MAX_ORCHESTRATOR_TURNS:
+                msg = ("I wasn't able to bring this request to a close within the allowed number of "
+                       "steps. The documents produced so far are in your Output Files panel — please "
+                       "try a narrower request for the remaining pieces.")
+                self.emit({"type": "error", "message": f"Orchestrator exceeded {MAX_ORCHESTRATOR_TURNS} turns."})
+                self.emit({"type": "response", "text": msg})
+                self.emit({"type": "done"})
+                return msg
             try:
-                response = _generate_with_retry(
-                    self.client, self.model, self.conversation_history, active_config
-                )
+                with Timer() as turn_timer:
+                    response = _generate_with_retry(
+                        self.client, self.model, self.conversation_history, active_config
+                    )
             except Exception as e:
+                log.exception("orchestrator model call failed",
+                              extra={"event": "run_failed", "turn": turns, "model": self.model})
                 self.emit({"type": "error", "message": str(e)})
                 self.emit({"type": "done"})
                 return f"Error: {str(e)}"
+
+            usage = getattr(response, "usage_metadata", None)
+            log.info("orchestrator turn %d", turns,
+                     extra={"event": "router_turn", "turn": turns, "duration_ms": turn_timer.ms,
+                            "finish_reason": str(getattr(response.candidates[0], "finish_reason", "")),
+                            "prompt_tokens": getattr(usage, "prompt_token_count", None),
+                            "thinking_tokens": getattr(usage, "thoughts_token_count", None),
+                            "output_tokens": getattr(usage, "candidates_token_count", None)})
 
             # After the first forced call, switch to AUTO so Gemini can
             # eventually give a text summary response.
@@ -308,11 +415,17 @@ class EventOrchestrator:
 
             if "MALFORMED_FUNCTION_CALL" in finish_reason:
                 malformed_retries += 1
+                log.warning("router emitted a malformed tool call",
+                            extra={"event": "router_malformed", "attempt": malformed_retries,
+                                   "model": self.model})
                 if malformed_retries > 2:
                     error_msg = (
                         "I encountered a technical issue routing your request. "
                         "Please try again — if the problem persists, try breaking your request into smaller parts."
                     )
+                    log.error("giving up after repeated malformed routing calls",
+                              extra={"event": "run_failed", "reason": "malformed_routing",
+                                     "attempts": malformed_retries})
                     self.emit({"type": "error", "message": "Malformed tool call after 3 retries."})
                     self.emit({"type": "response", "text": error_msg})
                     self.emit({"type": "done"})
@@ -340,6 +453,12 @@ class EventOrchestrator:
 
             if not function_calls:
                 final_text = "".join(p.text for p in candidate.content.parts if p.text)
+                log.info("run complete",
+                         extra={"event": "run_finished", "status": "success", "turns": turns,
+                                "files_produced": ",".join(f.filename for f in self.state.files),
+                                "file_count": len(self.state.files),
+                                "contributors": ",".join(self.state.contributors),
+                                "response_chars": len(final_text)})
                 self.emit({"type": "response", "text": final_text})
                 self.emit({"type": "done"})
                 return final_text
@@ -356,40 +475,58 @@ class EventOrchestrator:
                     "text": f"Routing to {meta.get('name', fc.name)}...",
                 })
                 handler = handlers.get(fc.name)
-                try:
-                    result = handler(**dict(fc.args)) if handler else f"Unknown tool: {fc.name}"
-                except Exception as e:
-                    result = f"Error: {str(e)}"
+                if not handler:
+                    result = AgentResult(text="", status="failed", error=f"Unknown tool: {fc.name}")
+                else:
+                    try:
+                        result = handler(**dict(fc.args))
+                    except Exception as e:
+                        log.exception("handler %s raised", fc.name)
+                        result = AgentResult(text="", status="failed", error=str(e))
 
-                result_str = str(result)
-                is_error = result_str.startswith("Error:") or result_str.startswith("AGENT_FAILED")
-
-                if is_error:
-                    failed_agents.append(meta.get("name", fc.name))
-                    # Wrap the error so Gemini cannot miss it
+                agent_label = meta.get("name", fc.name)
+                if result.status != "success":
+                    failed_agents.append(agent_label)
+                    partial = result.files
                     fn_parts.append(types.Part.from_function_response(
                         name=fc.name,
                         response={
                             "status": "AGENT_FAILED",
-                            "result": result_str,
-                            "files_generated": [],
+                            "error": result.error or "unknown error",
+                            "result": result.text[:4000],
+                            "files_generated": partial,
                             "instruction": (
-                                f"AGENT_FAILED: {meta.get('name', fc.name)} did not produce any files. "
-                                "Do NOT describe or list any documents from this agent. "
-                                "Tell the user this agent failed and to try again."
+                                f"AGENT_FAILED: {agent_label} did not complete. "
+                                + (f"It produced only these files before failing: {partial}. "
+                                   if partial else "It produced NO files. ")
+                                + "Do NOT describe any other documents from this agent. "
+                                "Tell the user which deliverables are missing and to try again."
                             ),
                         }
                     ))
                 else:
-                    succeeded_agents.append(meta.get("name", fc.name))
+                    succeeded_agents.append(agent_label)
                     fn_parts.append(types.Part.from_function_response(
-                        name=fc.name, response={"status": "SUCCESS", "result": result_str}
+                        name=fc.name, response={
+                            "status": "SUCCESS",
+                            "result": result.text,
+                            "files_generated": result.files,
+                        }
                     ))
 
-            # If EVERY agent failed, surface the error directly
-            if failed_agents and not succeeded_agents:
+            any_agent_succeeded = any_agent_succeeded or bool(succeeded_agents)
+
+            # Only bail out when nothing has succeeded in the entire run — a late
+            # failure after earlier successes must still be summarised honestly.
+            if failed_agents and not any_agent_succeeded:
+                # Record the responses first: conversation_history persists across user
+                # messages, and a function_call with no matching response would malform
+                # the next request in this session.
+                self.conversation_history.append(types.Content(role="user", parts=fn_parts))
                 error_detail = " | ".join(failed_agents)
-                print(f"[EventOrchestrator] All agents failed: {error_detail}", flush=True)
+                log.error("every delegated agent failed",
+                          extra={"event": "run_finished", "status": "all_failed", "turns": turns,
+                                 "failed_agents": error_detail})
                 self.emit({"type": "error", "message": f"Agent error: {error_detail}"})
                 fallback = (
                     "I ran into a technical problem completing your request. "
@@ -407,10 +544,15 @@ class EventOrchestrator:
             # hallucinate a positive summary for the failed ones.
             if failed_agents:
                 failed_list = ", ".join(failed_agents)
+                log.warning("partial failure in this turn",
+                            extra={"event": "turn_partial_failure", "turn": turns,
+                                   "failed_agents": failed_list,
+                                   "succeeded_agents": ", ".join(succeeded_agents)})
                 warning = (
-                    f"SYSTEM NOTICE — partial failure: The following agents FAILED and generated NO files: {failed_list}. "
+                    f"SYSTEM NOTICE — partial failure: these agents did NOT complete: {failed_list}. "
+                    "Report exactly the files listed in each agent's files_generated — for a failed "
+                    "agent that is usually none, and never more than what is listed. "
                     "You MUST tell the user clearly which deliverables are missing. "
-                    "Do NOT describe any documents from the failed agents as if they exist. "
                     "Only summarise outputs from the agents that succeeded."
                 )
                 self.conversation_history.append(
@@ -420,6 +562,8 @@ class EventOrchestrator:
             self.emit({"type": "thinking", "text": "Synthesizing results..."})
 
         fallback = "The request could not be completed — the agent returned an empty response. Please try again."
+        log.error("model returned no content and no tool calls",
+                  extra={"event": "run_finished", "status": "empty_response", "turns": turns})
         self.emit({"type": "error", "message": "Empty response from model — no content or tool calls returned."})
         self.emit({"type": "response", "text": fallback})
         self.emit({"type": "done"})

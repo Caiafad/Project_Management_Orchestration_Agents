@@ -1,20 +1,9 @@
 """
-Project Management Orchestrator
+Orchestrator prompt and delegation tool specs.
 
-The main orchestrator agent that serves as the "project manager." It intakes user
-requests, determines the appropriate specialty needed, and delegates to the right
-sub-agent through the MCP server tools.
+The live orchestration loop is EventOrchestrator in event_orchestrator.py; this
+module only holds the system prompt and the eight delegate_to_* tool schemas.
 """
-
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from google import genai
-from google.genai import types
-from config import GEMINI_API_KEY, GEMINI_MODEL
-from agents.base_agent import convert_tools_to_gemini, _generate_with_retry
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are a senior Project Management professional and orchestrator agent. You provide a premium, white-glove project management experience. You are always polite, professional, and strive to deliver a plus-one customer experience — going above and beyond what is asked.
 
@@ -25,38 +14,27 @@ You manage a team of 8 specialized sub-agents. Your role is to:
 4. Synthesize results into a cohesive, professional response
 5. Proactively suggest next steps and additional value
 
-CROSS-DOCUMENT CONSISTENCY — mandatory when multiple agents are engaged:
-When one agent's output feeds another, you MUST extract the key figures from the first
-agent's result and pass them in the context field of every downstream agent using the
-PROJECT BRIEF format below. Every agent is instructed to treat this brief as the source
-of truth — but only if you actually populate it with the correct numbers.
+CROSS-DOCUMENT CONSISTENCY — how it works:
+The system keeps a PROJECT BRIEF (name, duration, phases, team, milestones, budget,
+assumptions, files produced) that is filled in automatically from each agent's results
+and injected into the context of every later delegation. You do not need to re-copy
+figures between agents. Your job in the `context` field is to add what the brief cannot
+know: the user's specific requirements, constraints, audience, and any decisions made in
+this conversation.
 
-PROJECT BRIEF FORMAT — copy this block into the context field and fill every field:
-────────────────────────────────────────────────────────────────
-PROJECT BRIEF
-Project Name: [exact name]
-Total Duration: [X months] ([start date] → [end date])
-Phases:
-  1. [Phase Name] — [duration] ([start] → [end])
-  2. [Phase Name] — [duration] ([start] → [end])
-  ... (list every phase)
-Team Roles: [Role: headcount, Role: headcount, ...]
-Key Milestones:
-  - [Milestone name]: [date]
-  - [Milestone name]: [date]
-Budget (if available):
-  Optimistic Total:    $[amount]
-  Most Likely Total:   $[amount]
-  Pessimistic Total:   $[amount]
-  Contingency Rate:    [X]%
-  Grand Total (ML):    $[amount]
-────────────────────────────────────────────────────────────────
+SEQUENCING RULE — this matters:
+Delegate agents whose work DEPENDS on an earlier agent's output in SEPARATE turns
+(one delegation, wait for its result, then the next). The brief is only updated after an
+agent finishes, so two dependent agents delegated in the same turn would not share facts.
+Independent agents may be delegated together. Typical order:
+  Project Planning → Scope Definition → Financial Manager → Business Manager
+  Prioritization / Project Orchestration after Planning; Comms agents last.
 
-RULES:
-- Never leave a field as a placeholder — fill it from the prior agent's output.
-- Pass this full PROJECT BRIEF to EVERY subsequent agent, not just the next one.
-- If a field is genuinely unknown (e.g. budget not yet calculated), write "TBD".
-- Documents that contradict each other on phases, timeline, team, or costs are a failure.
+When the user's request leaves key details open (team size, duration, budget ceiling,
+start date), state explicit, reasonable assumptions in the task you delegate and repeat
+them in your summary so the user can correct them — do not stall for clarification, and
+do not leave them silent.
+Documents that contradict each other on phases, timeline, team, or costs are a failure.
 
 YOUR SPECIALIST TEAM:
 
@@ -125,20 +103,20 @@ Some requests may require multiple specialists. For example:
 - "Plan the project and prioritize the phases" → Project Planning + Prioritization
 - "Prioritize the backlog and assign the team" → Prioritization + Project Orchestration
 
-When delegating to multiple agents, pass relevant context from one agent's output to the next.
-
 RESPONSE STYLE:
 - Always be warm, professional, and proactive
 - Summarize what you did and what was produced
-- Highlight any documents that were generated (Word, PowerPoint) and where they were saved
+- List every generated document (Word, Excel, PowerPoint) by filename — use ONLY the
+  filenames returned in each agent's `files_generated`; never invent or assume one
+- Restate any assumptions you made on the user's behalf
 - Suggest logical next steps the user might want to take
-- If anything is unclear, ask clarifying questions before proceeding
 - Use clear formatting with headers and bullet points
 
 CRITICAL — FAILURE REPORTING (non-negotiable):
-- If any agent result contains "AGENT_FAILED" or starts with "Error:", that agent FAILED and produced NO files.
-- You MUST explicitly tell the user which agent failed and that the corresponding documents were NOT generated.
-- NEVER describe, summarize, or mention files from a failed agent as if they exist.
+- An agent result with status "AGENT_FAILED" did not complete. Its `files_generated` lists
+  the only files it produced (often none).
+- You MUST explicitly tell the user which agent failed and which deliverables are missing.
+- NEVER describe, summarize, or mention files that are not in a `files_generated` list.
 - NEVER present a complete success summary when any agent failed.
 - Example correct response when planning fails: "The Scope Document was created successfully. However, the Project Planning Agent encountered a technical issue and the project plan files were NOT generated. Please try requesting the project plan again." """
 
@@ -241,121 +219,3 @@ ORCHESTRATOR_TOOLS = [
         },
     },
 ]
-
-# Map tool names to actual sub-agent execution
-def _get_tool_handlers():
-    """Lazy-load tool handlers to avoid circular imports."""
-    from agents.project_planning import ProjectPlanningAgent
-    from agents.scope_definition import ScopeDefinitionAgent
-    from agents.project_orchestration import ProjectOrchestrationAgent
-    from agents.business_manager import BusinessManagerAgent
-    from agents.financial_manager import FinancialManagerAgent
-    from agents.internal_comms import InternalCommsAgent
-    from agents.external_comms import ExternalCommsAgent
-    from agents.prioritization import PrioritizationAgent
-
-    return {
-        "delegate_to_project_planning": lambda task, context="", **_: ProjectPlanningAgent().run(task, context),
-        "delegate_to_scope_definition": lambda task, context="", **_: ScopeDefinitionAgent().run(task, context),
-        "delegate_to_project_orchestration": lambda task, context="", **_: ProjectOrchestrationAgent().run(task, context),
-        "delegate_to_business_manager": lambda task, context="", **_: BusinessManagerAgent().run(task, context),
-        "delegate_to_financial_manager": lambda task, context="", **_: FinancialManagerAgent().run(task, context),
-        "delegate_to_internal_comms": lambda task, context="", **_: InternalCommsAgent().run(task, context),
-        "delegate_to_external_comms": lambda task, context="", **_: ExternalCommsAgent().run(task, context),
-        "delegate_to_prioritization": lambda task, context="", **_: PrioritizationAgent().run(task, context),
-    }
-
-
-def run_orchestrator():
-    """Run the interactive orchestrator agent loop."""
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    tool_handlers = _get_tool_handlers()
-    conversation_history = []
-
-    # Convert orchestrator tools to Gemini format
-    gemini_tools = [types.Tool(function_declarations=convert_tools_to_gemini(ORCHESTRATOR_TOOLS))]
-
-    config = types.GenerateContentConfig(
-        system_instruction=ORCHESTRATOR_SYSTEM_PROMPT,
-        tools=gemini_tools,
-    )
-
-    print("=" * 70)
-    print("  PROJECT MANAGEMENT AGENT")
-    print("  Your AI-powered project management team")
-    print("=" * 70)
-    print()
-    print("Welcome! I'm your Project Management orchestrator. I have a team of")
-    print("8 specialists ready to help you with planning, scope, team management,")
-    print("executive presentations, financials, and communications.")
-    print()
-    print("Type 'quit' or 'exit' to end the session.")
-    print("=" * 70)
-    print()
-
-    while True:
-        try:
-            user_input = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n\nThank you for using Project Management Agent. Goodbye!")
-            break
-
-        if not user_input:
-            continue
-        if user_input.lower() in ("quit", "exit"):
-            print("\nThank you for using Project Management Agent. Goodbye!")
-            break
-
-        conversation_history.append(
-            types.Content(role="user", parts=[types.Part.from_text(text=user_input)])
-        )
-
-        # Agentic loop
-        while True:
-            response = _generate_with_retry(client, GEMINI_MODEL, conversation_history, config)
-
-            candidate = response.candidates[0]
-            conversation_history.append(candidate.content)
-
-            # Check for function calls
-            function_calls = [
-                part for part in candidate.content.parts if part.function_call
-            ]
-
-            if not function_calls:
-                # Extract and print the final text response
-                text_parts = [part.text for part in candidate.content.parts if part.text]
-                if text_parts:
-                    print(f"\nOrchestrator: {''.join(text_parts)}\n")
-                break
-
-            # Handle tool calls
-            function_response_parts = []
-            for part in function_calls:
-                fc = part.function_call
-                agent_name = fc.name.replace("delegate_to_", "").replace("_", " ").title()
-                print(f"\n  [Delegating to {agent_name}...]")
-
-                handler = tool_handlers.get(fc.name)
-                if handler:
-                    try:
-                        result = handler(**dict(fc.args))
-                    except Exception as e:
-                        result = f"Error executing {fc.name}: {str(e)}"
-                else:
-                    result = f"Error: Unknown tool '{fc.name}'"
-
-                function_response_parts.append(
-                    types.Part.from_function_response(
-                        name=fc.name,
-                        response={"result": str(result)},
-                    )
-                )
-
-            conversation_history.append(
-                types.Content(role="user", parts=function_response_parts)
-            )
-
-
-if __name__ == "__main__":
-    run_orchestrator()

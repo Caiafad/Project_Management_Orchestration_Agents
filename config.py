@@ -30,7 +30,10 @@ def model_for(tier: str, agent_key: str | None = None) -> str:
             return override
     return MODEL_TIERS[tier]
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL") or MODEL_REASONING  # orchestrator
+# The orchestrator/router. Override with MODEL_OVERRIDE_ORCHESTRATOR, not GEMINI_MODEL —
+# a bare GEMINI_MODEL in a stale .env used to silently pin every agent to one old model.
+ORCHESTRATOR_MODEL = model_for("reasoning", "ORCHESTRATOR")
+GEMINI_MODEL = ORCHESTRATOR_MODEL  # legacy alias; BaseAgent falls back to this
 
 # Vertex AI Search
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
