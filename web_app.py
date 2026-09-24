@@ -17,6 +17,7 @@ import hmac
 import threading
 import asyncio
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -182,9 +183,13 @@ async def gmail_status(username: str = Depends(require_auth)):
     return {"connected": has_token(username)}
 
 
-def _gmail_redirect_uri() -> str:
-    """Read the redirect URI directly from the credentials file so it always
-    matches exactly what is registered in Google Cloud Console."""
+def _gmail_redirect_uri(request: Request = None) -> str:
+    """Pick the registered redirect URI that belongs to the host being served.
+
+    The credentials file lists every URI registered in Google Cloud Console.
+    Taking uris[0] blindly breaks once the same image runs as more than one
+    service (the trial deployment would send users back to the main service and
+    lose the session), so match on host and fall back to the first entry."""
     import json as _json
     with open(GMAIL_CREDENTIALS_PATH) as f:
         data = _json.load(f)
@@ -192,6 +197,15 @@ def _gmail_redirect_uri() -> str:
     uris = client.get("redirect_uris", [])
     if not uris:
         raise RuntimeError("No redirect_uris found in credentials file.")
+
+    host = (request.headers.get("host") if request else None) or ""
+    if host:
+        for uri in uris:
+            if urlparse(uri).netloc == host:
+                return uri
+        log.warning("no registered Gmail redirect URI matches this host — using the first",
+                    extra={"event": "gmail_redirect_host_mismatch", "request_host": host,
+                           "registered": ",".join(uris)})
     return uris[0]
 
 
@@ -201,7 +215,7 @@ async def gmail_oauth_start(request: Request, username: str = Depends(require_au
     from google_auth_oauthlib.flow import Flow
     flow = Flow.from_client_secrets_file(
         GMAIL_CREDENTIALS_PATH, scopes=GMAIL_SCOPES,
-        redirect_uri=_gmail_redirect_uri(),
+        redirect_uri=_gmail_redirect_uri(request),
     )
     auth_url, state = flow.authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true"
@@ -234,7 +248,7 @@ async def gmail_oauth_callback(
 
     flow = Flow.from_client_secrets_file(
         GMAIL_CREDENTIALS_PATH, scopes=GMAIL_SCOPES,
-        redirect_uri=_gmail_redirect_uri(), state=state,
+        redirect_uri=_gmail_redirect_uri(request), state=state,
     )
     # Pass PKCE code_verifier if it was stored during /start
     code_verifier = request.cookies.get("oauth_cv")
@@ -254,6 +268,21 @@ async def gmail_oauth_callback(
 
 # ── Slack OAuth (per-user "Add to Slack") ────────────────────────────────────
 
+def _slack_redirect_uri(request: Request) -> str:
+    """Slack's callback for the host being served.
+
+    SLACK_REDIRECT_URI pins one URL, which is wrong as soon as the same image
+    runs as both the main and the trial service — the callback would land on the
+    other deployment, where the visitor has no session. Derive it from the
+    request instead and keep the env var as an override for local development.
+    Every URL used must also be registered in the Slack app's Redirect URLs."""
+    if SLACK_REDIRECT_URI:
+        return SLACK_REDIRECT_URI
+    host = request.headers.get("host", "")
+    scheme = request.headers.get("x-forwarded-proto", "https" if "localhost" not in host else "http")
+    return f"{scheme}://{host}/oauth/slack/callback"
+
+
 @app.get("/api/slack/status")
 async def slack_status(username: str = Depends(require_auth)):
     """Return whether the current user has connected their own Slack workspace."""
@@ -262,14 +291,14 @@ async def slack_status(username: str = Depends(require_auth)):
     return {
         "connected": bool(token),
         "team_name": token.get("team_name") if token else None,
-        "configured": bool(SLACK_CLIENT_ID and SLACK_CLIENT_SECRET and SLACK_REDIRECT_URI),
+        "configured": bool(SLACK_CLIENT_ID and SLACK_CLIENT_SECRET),
     }
 
 
 @app.get("/oauth/slack/start")
-async def slack_oauth_start(username: str = Depends(require_auth)):
+async def slack_oauth_start(request: Request, username: str = Depends(require_auth)):
     """Redirect user to Slack's consent screen to install the app in their workspace."""
-    if not (SLACK_CLIENT_ID and SLACK_CLIENT_SECRET and SLACK_REDIRECT_URI):
+    if not (SLACK_CLIENT_ID and SLACK_CLIENT_SECRET):
         raise HTTPException(status_code=503, detail="Slack OAuth is not configured on this server.")
     import secrets
     from urllib.parse import urlencode
@@ -277,7 +306,7 @@ async def slack_oauth_start(username: str = Depends(require_auth)):
     params = urlencode({
         "client_id": SLACK_CLIENT_ID,
         "scope": SLACK_OAUTH_SCOPES,
-        "redirect_uri": SLACK_REDIRECT_URI,
+        "redirect_uri": _slack_redirect_uri(request),
         "state": state,
     })
     cookie_secure = os.environ.get("COOKIE_SECURE", "true").lower() == "true"
@@ -311,7 +340,7 @@ async def slack_oauth_callback(
             client_id=SLACK_CLIENT_ID,
             client_secret=SLACK_CLIENT_SECRET,
             code=code,
-            redirect_uri=SLACK_REDIRECT_URI,
+            redirect_uri=_slack_redirect_uri(request),
         )
     except SlackApiError as e:
         raise HTTPException(status_code=400, detail=f"Slack authorisation failed: {e.response.get('error')}")
