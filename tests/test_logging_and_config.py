@@ -115,3 +115,30 @@ def test_guest_agents_use_the_fast_tier():
     from agents.financial_manager import FinancialManagerAgent
     assert FinancialManagerAgent(is_guest=True).model == config.MODEL_FAST
     assert FinancialManagerAgent().model == config.MODEL_REASONING
+
+
+def test_reserved_keys_in_extra_do_not_raise():
+    # logging raises KeyError for extra keys that collide with LogRecord attributes;
+    # this crashed a tool handler and failed a whole agent run before the guard.
+    from logging_setup import configure
+    configure("INFO")
+    logging.getLogger("pm.test").info(
+        "file produced", extra={"filename": "Plan.xlsx", "module": "x", "event": "file_created"})
+
+
+def test_guard_renames_the_colliding_key_and_keeps_the_value():
+    from logging_setup import _install_reserved_key_guard
+    _install_reserved_key_guard()
+    captured = []
+    handler = logging.Handler()
+    handler.emit = captured.append
+    logger = logging.getLogger("pm.guard.test")
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        logger.info("x", extra={"filename": "Plan.xlsx", "doc_type": "excel"})
+    finally:
+        logger.removeHandler(handler)
+    record = captured[0]
+    assert record.x_filename == "Plan.xlsx"
+    assert record.doc_type == "excel"

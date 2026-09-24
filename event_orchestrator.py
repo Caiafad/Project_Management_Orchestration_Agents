@@ -29,6 +29,7 @@ from logging_setup import Timer, bind, context as log_context, new_run_id
 log = logging.getLogger(__name__)
 
 MAX_ORCHESTRATOR_TURNS = 12
+MAX_REVISIONS = 2          # validation retries per file before it is accepted as-is
 # Agents whose summaries carry project facts worth folding into the shared state.
 STATE_CONTRIBUTORS = {
     "delegate_to_project_planning", "delegate_to_scope_definition",
@@ -98,12 +99,55 @@ _DOC_TOOLS = {
 
 
 def _wrap_tool_handlers(tool_handlers: dict, emit: Callable, username: str = None,
-                        files_out: list | None = None) -> dict:
-    """Wrap a sub-agent's tool handlers to emit UI events, upload output files to
-    GCS, and record every file created into `files_out` (the agent's
-    files_created list) so the orchestrator gets an exact list back."""
+                        files_out: list | None = None, doc_spec: dict | None = None,
+                        revisions: dict | None = None) -> dict:
+    """Wrap a sub-agent's tool handlers to emit UI events, validate and upload output
+    files, and record every file created into `files_out` (the agent's files_created
+    list) so the orchestrator gets an exact list back.
+
+    When a produced file fails validation the issues are returned to the agent as the
+    tool result, so its own loop fixes them — at most MAX_REVISIONS times per file,
+    after which the file is accepted and the problems are logged."""
     wrapped = {}
     files_out = files_out if files_out is not None else []
+    revisions = revisions if revisions is not None else {}
+
+    def _validate(paths: list) -> dict | None:
+        """Returns a needs_revision payload, or None when the files are acceptable."""
+        if not doc_spec or not paths:
+            return None
+        from tools.doc_validator import validate_outputs
+        with Timer() as t:
+            report = validate_outputs(paths, doc_spec)
+        names = [Path(p).name for p in paths]
+        if report["ok"]:
+            log.info("documents passed validation",
+                     extra={"event": "validation_passed", "files": ",".join(names),
+                            "duration_ms": t.ms})
+            return None
+
+        key = "|".join(sorted(names))
+        revisions[key] = revisions.get(key, 0) + 1
+        attempt = revisions[key]
+        flat = [f"{name}: {issue}" for name, items in report["issues"].items() for issue in items]
+        log.warning("documents failed validation",
+                    extra={"event": "validation_failed", "files": ",".join(names),
+                           "attempt": attempt, "issue_count": len(flat),
+                           "issues": " | ".join(flat)[:1500], "duration_ms": t.ms})
+        if attempt > MAX_REVISIONS:
+            log.error("accepting document after %d failed revisions", MAX_REVISIONS,
+                      extra={"event": "validation_exhausted", "files": ",".join(names),
+                             "issues": " | ".join(flat)[:1500]})
+            return None
+        emit({"type": "tool_call", "tool": "check",
+              "description": f"Checking document ({len(flat)} issue(s) to fix)..."})
+        return {"status": "needs_revision", "attempt": attempt,
+                "issues": report["issues"],
+                "instruction": (
+                    "The file was written but does NOT meet the required structure. "
+                    "Fix every issue listed and call the tool again with the corrected "
+                    "content, using the same filename so the file is replaced."
+                )}
 
     def _gcs_upload(local_path):
         if not username:
@@ -119,8 +163,9 @@ def _wrap_tool_handlers(tool_handlers: dict, emit: Callable, username: str = Non
         size = path.stat().st_size if path.exists() else 0
         _gcs_upload(path)
         files_out.append(path.name)
-        log.info("file produced", extra={"event": "file_created", "filename": path.name,
-                                        "doc_type": doc_type, "bytes": size})
+        # NB: "filename" is a reserved LogRecord attribute — use file_name.
+        log.info("file produced", extra={"event": "file_created", "file_name": path.name,
+                                         "doc_type": doc_type, "bytes": size})
         emit({"type": "document_created", "doc_type": doc_type,
               "filename": path.name, "path": str(path)})
 
@@ -157,10 +202,14 @@ def _wrap_tool_handlers(tool_handlers: dict, emit: Callable, username: str = Non
                         log.error("execute_python stderr", extra={"event": "tool_stderr",
                                                                   "tool": "execute_python",
                                                                   "stderr": stderr_tail})
-                    for fpath in produced:
-                        doc_type = _EXT_TO_DOC_TYPE.get(fpath.suffix.lower())
-                        if doc_type:
-                            _record(fpath, doc_type)
+                    documents = [p for p in produced if p.suffix.lower() in _EXT_TO_DOC_TYPE]
+                    if exit_code == 0 and documents:
+                        revision = _validate(documents)
+                        if revision:
+                            # Don't record or upload yet — the agent gets another pass.
+                            return json.dumps(revision, indent=2)
+                    for fpath in documents:
+                        _record(fpath, _EXT_TO_DOC_TYPE[fpath.suffix.lower()])
                     return result
                 return fn
             wrapped[name] = make_python(handler)
@@ -197,6 +246,9 @@ def _wrap_tool_handlers(tool_handlers: dict, emit: Callable, username: str = Non
                         log.info("%s created a document", tool_name,
                                  extra={"event": "tool_finished", "tool": tool_name,
                                         "title": str(title)[:120], "duration_ms": t.ms})
+                        revision = _validate([d["file_path"]])
+                        if revision:
+                            return json.dumps(revision, indent=2)
                         _record(d["file_path"], doc_type)
                     else:
                         log.error("%s did not create a file", tool_name,
@@ -243,7 +295,9 @@ def _create_event_agent(tool_name: str, emit: Callable, username: str = None, is
         agent = cls(username=username, is_guest=is_guest)
     else:
         agent = cls(is_guest=is_guest)
-    agent.tool_handlers = _wrap_tool_handlers(agent.tool_handlers, emit, username, agent.files_created)
+    agent.tool_handlers = _wrap_tool_handlers(
+        agent.tool_handlers, emit, username, agent.files_created, agent.DOC_SPEC,
+    )
     return agent
 
 

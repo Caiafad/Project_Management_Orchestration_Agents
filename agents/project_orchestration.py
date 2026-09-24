@@ -56,6 +56,11 @@ class ProjectOrchestrationAgent(BaseAgent):
     TIER = "fast"
     AGENT_KEY = "PROJECT_ORCHESTRATION"
 
+    DOC_SPEC = {
+        "docx": {"min_sections": 3},
+        "xlsx": {"min_rows": 3},
+    }
+
     def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Project Orchestration Agent",

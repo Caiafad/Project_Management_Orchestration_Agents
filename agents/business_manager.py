@@ -137,6 +137,11 @@ class BusinessManagerAgent(BaseAgent):
     TIER = "reasoning"
     AGENT_KEY = "BUSINESS_MANAGER"
 
+    # Executive decks: 8-12 slides, at most five bullets each (see SYSTEM_PROMPT).
+    DOC_SPEC = {
+        "pptx": {"min_slides": 8, "max_slides": 14, "max_bullets_per_slide": 5},
+    }
+
     def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Business Manager Agent",

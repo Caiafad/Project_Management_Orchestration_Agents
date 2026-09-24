@@ -72,6 +72,11 @@ class PrioritizationAgent(BaseAgent):
     TIER = "fast"
     AGENT_KEY = "PRIORITIZATION"
 
+    DOC_SPEC = {
+        "xlsx": {"min_rows": 3},
+        "docx": {"min_sections": 3},
+    }
+
     def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Prioritization Agent",

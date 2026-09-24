@@ -111,6 +111,22 @@ class ScopeDefinitionAgent(BaseAgent):
     TIER = "reasoning"
     AGENT_KEY = "SCOPE_DEFINITION"
 
+    # Mirrors the MANDATORY DOCUMENT STRUCTURE in SYSTEM_PROMPT above.
+    DOC_SPEC = {
+        "docx": {
+            "required_headings": [
+                "Introduction", "Project Overview", "In-Scope", "Out-of-Scope",
+                "Functional Requirements", "Non-Functional Requirements",
+                "Assumptions and Constraints", "Acceptance Criteria",
+                "Scope Change Management",
+            ],
+            "min_sections": 9,
+            # \b before FR stops NFR-001 counting as a functional requirement.
+            "min_numbered": [(r"\bFR-\d+", 8, "functional requirements (FR-xxx)"),
+                             (r"\bNFR-\d+", 7, "non-functional requirements (NFR-xxx)")],
+        },
+    }
+
     def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Scope Definition Agent",

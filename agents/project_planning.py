@@ -200,6 +200,12 @@ class ProjectPlanningAgent(BaseAgent):
     TIER = "reasoning"
     AGENT_KEY = "PROJECT_PLANNING"
 
+    # The Excel workbook must carry both the Gantt and the dependency table.
+    DOC_SPEC = {
+        "xlsx": {"required_sheets": ["Gantt Chart", "Task & Dependencies"]},
+        "docx": {"min_sections": 6},
+    }
+
     def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Project Planning Agent",

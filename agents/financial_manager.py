@@ -320,6 +320,31 @@ class FinancialManagerAgent(BaseAgent):
     TIER = "reasoning"
     AGENT_KEY = "FINANCIAL_MANAGER"
 
+    # Mirrors the five required sheets and seven required Word sections above.
+    DOC_SPEC = {
+        "xlsx": {
+            "required_sheets": ["Summary", "Labor Detail", "Infrastructure",
+                                "Monthly Cash Flow", "Assumptions"],
+            "total_rows": {"Labor Detail": "TOTAL LABOR",
+                           "Infrastructure": "TOTAL INFRASTRUCTURE",
+                           "Summary": "GRAND TOTAL",
+                           "Monthly Cash Flow": "TOTAL"},
+        },
+        "docx": {
+            "required_headings": [
+                "Executive Summary", "Cost Breakdown by Project Phase", "Labor Cost Detail",
+                "Infrastructure & Tooling Costs", "Monthly Cash Flow",
+                "Assumptions & Rate Sources", "Risk & Contingency",
+            ],
+            "required_tables": [
+                "Executive Summary", "Cost Breakdown by Project Phase", "Labor Cost Detail",
+                "Infrastructure & Tooling Costs", "Monthly Cash Flow",
+                "Assumptions & Rate Sources", "Risk & Contingency",
+            ],
+        },
+        "cross_check": {"xlsx_totals_match_docx": True},
+    }
+
     def __init__(self, is_guest: bool = False):
         super().__init__(
             name="Financial Manager Agent",

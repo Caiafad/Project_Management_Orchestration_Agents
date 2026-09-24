@@ -36,6 +36,8 @@ CONTEXT_FIELDS = ("user", "run_id", "agent")
 # Attributes already on a LogRecord — anything else passed via extra= is ours.
 _STANDARD = set(vars(logging.LogRecord("", 0, "", 0, "", (), None)).keys()) | {
     "asctime", "message", "taskName"}
+# Keys that logging refuses to accept in extra= (it raises KeyError).
+_RESERVED = _STANDARD
 
 IN_CLOUD_RUN = bool(os.environ.get("K_SERVICE"))
 
@@ -116,8 +118,31 @@ class LocalFormatter(logging.Formatter):
         return base
 
 
+def _install_reserved_key_guard() -> None:
+    """Stop `extra={"filename": ...}` from raising.
+
+    logging.makeRecord raises KeyError for any extra key that collides with a
+    LogRecord attribute (filename, module, name, message, args, ...). That turned
+    a log line into an exception that propagated out of a tool handler and failed
+    the whole agent run. Colliding keys are renamed instead.
+    """
+    if getattr(logging.Logger, "_pm_guard_installed", False):
+        return
+    original = logging.Logger.makeRecord
+
+    def makeRecord(self, name, level, fn, lno, msg, args, exc_info,
+                   func=None, extra=None, sinfo=None):
+        if extra:
+            extra = {(f"x_{k}" if k in _RESERVED else k): v for k, v in extra.items()}
+        return original(self, name, level, fn, lno, msg, args, exc_info, func, extra, sinfo)
+
+    logging.Logger.makeRecord = makeRecord
+    logging.Logger._pm_guard_installed = True
+
+
 def configure(level: str | None = None) -> None:
     """Install handlers. Safe to call more than once."""
+    _install_reserved_key_guard()
     root = logging.getLogger()
     for handler in root.handlers[:]:          # replace uvicorn's default handlers
         root.removeHandler(handler)
