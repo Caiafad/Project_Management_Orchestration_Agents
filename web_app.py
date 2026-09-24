@@ -105,9 +105,13 @@ async def trial_start(email: str = Form(...)):
     try:
         if daily_cap_reached():
             # Degrade to lead capture only — never a broken page.
+            from tools.trial_store import record_lead
+            record_lead(email, "", source="capacity-waitlist")
             append_lead(email, "capacity-waitlist")
+            log.info("trial at capacity — lead captured for the waitlist",
+                     extra={"event": "trial_waitlisted", "lead_email": email})
             return RedirectResponse("/trial?full=1", status_code=303)
-        guest_id = create_guest(email)
+        guest_id = create_guest(email)   # also records the lead in Firestore
     except Exception as e:
         log.exception("could not create trial session",
                       extra={"event": "trial_signup_failed", "lead_email": email})

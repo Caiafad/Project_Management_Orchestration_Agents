@@ -1,22 +1,33 @@
 """
 Trial/guest quota tracking — Firestore-backed.
 
-Two collections:
+Three collections:
   trial_sessions/{guest_id}      — {email, created_at, generations_used}
   trial_quota_daily/{YYYY-MM-DD} — {count}   (atomic global counter)
+  trial_leads/{auto}             — {email, created_at, guest_id, source}
+
+Leads live here, not in the Google Sheet: Cloud Run's service-account token
+carries the cloud-platform scope, which the Sheets API rejects, so a
+Sheets-only capture would drop every lead silently. The Sheet is a best-effort
+mirror (tools/leads_sheet.py); Firestore is the record. Sessions expire nightly,
+leads do not.
 
 Guest identity itself (the "guest-xxxx" username) is minted by the caller
 (web_app.py) and reused as-is for GCS/Vertex isolation — see tools/gcs_output.py.
 """
 
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 
 from google.cloud import firestore
 from config import TRIAL_SESSION_HOURS, TRIAL_MAX_GENERATIONS, TRIAL_DAILY_CAP
 
+log = logging.getLogger(__name__)
+
 SESSIONS_COLLECTION = "trial_sessions"
 DAILY_COLLECTION = "trial_quota_daily"
+LEADS_COLLECTION = "trial_leads"
 
 
 def _client() -> firestore.Client:
@@ -46,7 +57,41 @@ def create_guest(email: str) -> str:
         "created_at": firestore.SERVER_TIMESTAMP,
         "generations_used": 0,
     })
+    record_lead(email, guest_id)
     return guest_id
+
+
+def record_lead(email: str, guest_id: str, source: str = "trial") -> None:
+    """Persist a lead. Never raises — a capture failure must not block signup,
+    but it is logged at ERROR because a lost lead is the point of the trial."""
+    try:
+        _client().collection(LEADS_COLLECTION).add({
+            "email": email,
+            "guest_id": guest_id,
+            "source": source,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        })
+    except Exception as e:
+        log.error("could not record trial lead: %s", e,
+                  extra={"event": "lead_record_failed", "lead_email": email})
+
+
+def list_leads(limit: int = 500) -> list[dict]:
+    """All captured leads, newest first — for export to the Sheet or a CRM."""
+    docs = (_client().collection(LEADS_COLLECTION)
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(limit).stream())
+    out = []
+    for doc in docs:
+        data = doc.to_dict()
+        created = data.get("created_at")
+        out.append({
+            "email": data.get("email", ""),
+            "created_at": created.isoformat() if created else "",
+            "guest_id": data.get("guest_id", ""),
+            "source": data.get("source", ""),
+        })
+    return out
 
 
 def generations_remaining(guest_id: str) -> int:
