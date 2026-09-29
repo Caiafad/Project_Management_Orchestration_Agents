@@ -328,7 +328,11 @@ class EventOrchestrator:
         self.client = genai.Client(api_key=GEMINI_API_KEY)
         self.conversation_history = []
         self.state = ProjectState()      # shared source of truth across delegations
-        self.tools = ORCHESTRATOR_TOOLS
+        # External Comms is email-only, and Gmail is unavailable to trial guests
+        # (Google gates the restricted scope to test-user accounts), so the tool is
+        # removed rather than left to fail — the model cannot route to it at all.
+        self.tools = [t for t in ORCHESTRATOR_TOOLS
+                      if not (is_guest and t["name"] == "delegate_to_external_comms")]
         self.gemini_tools = [types.Tool(
             function_declarations=convert_tools_to_gemini(self.tools)
         )]

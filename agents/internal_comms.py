@@ -101,6 +101,20 @@ TOOLS = [
 ]
 
 
+# Gmail needs Google's approval of a restricted scope (gmail.modify), which only
+# covers accounts on the OAuth consent screen's test-user list. Trial guests are
+# strangers, so email tools are withheld from them and only Slack remains.
+GMAIL_TOOL_NAMES = {"send_email", "read_emails", "search_emails", "draft_email"}
+
+GUEST_PROMPT_NOTE = """
+
+TRIAL SESSION — EMAIL UNAVAILABLE:
+You have no email tools in this session. Do not offer to send, draft, read or
+search email, and never claim an email was sent. Use Slack for everything, and
+if the user asks for email, say plainly that email is not available in the trial
+and offer to post the message to Slack instead."""
+
+
 class InternalCommsAgent(BaseAgent):
     TIER = "fast"
     AGENT_KEY = "INTERNAL_COMMS"
@@ -117,10 +131,16 @@ class InternalCommsAgent(BaseAgent):
             "list_slack_channels":lambda **_:                          list_slack_channels(username=username),
         }
 
+        tools, prompt = TOOLS, SYSTEM_PROMPT
+        if is_guest:
+            tools = [t for t in TOOLS if t["name"] not in GMAIL_TOOL_NAMES]
+            tool_handlers = {k: v for k, v in tool_handlers.items() if k not in GMAIL_TOOL_NAMES}
+            prompt = SYSTEM_PROMPT + GUEST_PROMPT_NOTE
+
         super().__init__(
             name="Internal Communications Agent",
-            system_prompt=SYSTEM_PROMPT,
-            tools=TOOLS,
+            system_prompt=prompt,
+            tools=tools,
             tool_handlers=tool_handlers,
             is_guest=is_guest,
         )

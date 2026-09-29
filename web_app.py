@@ -176,11 +176,26 @@ async def root(username: str = Depends(require_auth)):
     return FileResponse("static/index.html")
 
 
+def _require_gmail_access(username: str) -> None:
+    """Gmail uses the restricted gmail.modify scope, which Google only permits for
+    accounts on the OAuth consent screen's test-user list. Trial guests are
+    strangers, so they would hit Google's 'app is blocked' page — refuse here
+    instead, with an explanation the UI can show."""
+    if is_guest(username):
+        raise HTTPException(
+            status_code=403,
+            detail="Email is not available in the trial. Slack and document "
+                   "generation are fully available.",
+        )
+
+
 @app.get("/api/gmail/status")
 async def gmail_status(username: str = Depends(require_auth)):
     """Return whether the current user has a connected Gmail token."""
     from tools.gmail_token_store import has_token
-    return {"connected": has_token(username)}
+    if is_guest(username):
+        return {"connected": False, "available": False}
+    return {"connected": has_token(username), "available": True}
 
 
 def _gmail_redirect_uri(request: Request = None) -> str:
@@ -212,6 +227,7 @@ def _gmail_redirect_uri(request: Request = None) -> str:
 @app.get("/oauth/gmail/start")
 async def gmail_oauth_start(request: Request, username: str = Depends(require_auth)):
     """Redirect user to Google's consent screen to authorise Gmail access."""
+    _require_gmail_access(username)
     from google_auth_oauthlib.flow import Flow
     flow = Flow.from_client_secrets_file(
         GMAIL_CREDENTIALS_PATH, scopes=GMAIL_SCOPES,
@@ -239,6 +255,7 @@ async def gmail_oauth_callback(
     username: str = Depends(require_auth),
 ):
     """Exchange auth code for token and store it in GCS for this user."""
+    _require_gmail_access(username)
     from google_auth_oauthlib.flow import Flow
     from tools.gmail_token_store import save_token
 

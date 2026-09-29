@@ -675,6 +675,13 @@ async function checkGmailStatus() {
     const btn    = document.getElementById("gmail-btn");
     const label  = document.getElementById("gmail-btn-text");
     const status = document.getElementById("gmail-status-text");
+    // Gmail needs a Google-approved restricted scope, which trial guests can't
+    // have. Hide it rather than show a button that leads to Google's block page.
+    if (data.available === false) {
+      btn.closest(".comms-item").hidden = true;
+      document.querySelector(".comms-grid")?.classList.add("single");
+      return;
+    }
     if (data.connected) {
       btn.classList.add("connected");
       btn.onclick = null;           // disable click when already connected
