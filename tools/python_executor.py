@@ -5,6 +5,8 @@ import json
 import tempfile
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
 
 def execute_python(code: str, timeout: int = 120, output_dir=None) -> str:
     """Execute Python code in a subprocess and return the output.
@@ -27,8 +29,6 @@ def execute_python(code: str, timeout: int = 120, output_dir=None) -> str:
     excel_helpers = '''
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter as _gcl
-
-log = logging.getLogger(__name__)
 
 _HEADER_FONT   = Font(bold=True, color="FFFFFF", size=11)
 _HEADER_FILL   = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
